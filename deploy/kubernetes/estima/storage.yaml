@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: estima-postgres-data
+  labels:
+    app.kubernetes.io/part-of: estima
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: replace-with-storage-class
+  resources:
+    requests:
+      storage: 10Gi

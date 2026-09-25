@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "estima-service"
+version = "0.1.0"
+description = "Shared, durable memory API for FCAPSule investigations"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115,<1",
+  "psycopg[binary]>=3.2,<4",
+  "uvicorn[standard]>=0.30,<1",
+]
+
+[project.optional-dependencies]
+test = ["httpx>=0.27,<1"]
+
+[tool.setuptools.packages.find]
+include = ["estima*"]
+
+[tool.setuptools.package-data]
+estima = ["migrations/*.sql"]

@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fcapsule-atlas-test-runtime
+  labels:
+    app.kubernetes.io/part-of: fcapsule-atlas-test
+data:
+  FCAPSULE_LIVE_ENABLED: "false"
+  FCAPSULE_ESTIMA_URL: "http://estima.fcapsule-atlas-test.svc.cluster.local:8080"
+  FCAPSULE_ESTIMA_READ: "true"
+  FCAPSULE_ESTIMA_PUBLISH: "true"
