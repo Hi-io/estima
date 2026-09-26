@@ -19,7 +19,7 @@ Collective requires PostgreSQL 14 or newer and Python 3.11 or newer.
 
 ```sh
 export DATABASE_URL='postgresql://estima:password@localhost:5432/estima'
-export COLLECTIVE_API_TOKEN="$(openssl rand -hex 32)"
+export COLLECTIVE_ADMIN_TOKEN="$(openssl rand -hex 32)"
 python -m pip install -e .
 python -m uvicorn estima.app:app --host 0.0.0.0 --port 8080
 ```
@@ -27,9 +27,10 @@ python -m uvicorn estima.app:app --host 0.0.0.0 --port 8080
 The `estima` Python module path is retained for existing launch commands. At
 startup Collective applies versioned SQL migrations and becomes ready only
 after PostgreSQL is reachable. `/healthz` is unauthenticated; all data routes
-require `Authorization: Bearer $COLLECTIVE_API_TOKEN`. `DATABASE_URL` is the
-database connection setting. `ESTIMA_API_TOKEN` and `ATLAS_API_TOKEN` remain
-accepted as fallbacks for existing deployments.
+require a bearer credential. `COLLECTIVE_ADMIN_TOKEN` is an operator-only
+credential for provisioning and revocation; it cannot publish a case directly.
+`DATABASE_URL` is the database connection setting. `ESTIMA_API_TOKEN` and
+`ATLAS_API_TOKEN` remain accepted as legacy token fallbacks.
 
 Run the container locally:
 
@@ -37,13 +38,14 @@ Run the container locally:
 docker build -t collective-service:local .
 docker run --rm -p 8080:8080 \
   -e DATABASE_URL='postgresql://estima:password@host.docker.internal:5432/estima' \
-  -e COLLECTIVE_API_TOKEN="$COLLECTIVE_API_TOKEN" collective-service:local
+  -e COLLECTIVE_ADMIN_TOKEN="$COLLECTIVE_ADMIN_TOKEN" collective-service:local
 ```
 
 ## API
 
-The versioned `/v1` wire contract remains compatible with the existing
-FCAPSule client:
+The `/v1` route and case payload contract remain wire-compatible with the
+existing FCAPSule client; publishers must use an instance-bound credential as
+described under [Credential Migration And Trust Boundary](#credential-migration-and-trust-boundary):
 
 - `POST /v1/cases` stores a versioned case envelope with `instance_id`,
   `episode_id`, `revision`, timezone-aware `observed_at`, `scope`, `summary`,
@@ -67,6 +69,16 @@ FCAPSule client:
 - `GET /v1/patterns` returns repeated typed observations; `GET
   /v1/patterns/{id}` returns the aggregate and member cases. Co-occurrence is
   not reported as a shared cause.
+- `POST /v1/admin/instances/{instance_id}/publisher-credentials` provisions a
+  publisher bound to that instance. `POST /v1/admin/reader-credentials`
+  provisions a read-only organization reader. The generated secret is returned
+  once; only its hash is stored.
+- `POST /v1/credentials/rotate` rotates the authenticated publisher's key. The
+  replacement retains the same instance binding; both keys work during the
+  configured overlap (five minutes by default, at most one hour), after which
+  the old key is rejected. `DELETE /v1/admin/credentials/{key_id}` revokes a
+  key immediately. Credential issuance, rotation, and revocation write
+  non-secret audit metadata.
 
 Observation facts and unverified hypotheses use separate fields and remain
 separate in storage and responses. Collective does not infer causes, resolutions,
@@ -76,9 +88,43 @@ workload, CNFC ID, and VNFC ID.
 Bodies are limited to 40 KiB; observations must be scalar, and bounds reject
 secret-looking fields/values and nested raw telemetry. These checks are
 defense in depth, not a substitute for upstream data minimization, TLS,
-authorization, backups, and secret management. Authentication uses a shared
-service token and assumes a trusted, single-organization deployment. It is not
-per-instance authorization, so callers can claim any `instance_id`.
+backups, and secret management.
+
+## Credential Migration And Trust Boundary
+
+Publisher credentials are bound server-side to one `instance_id`. A matching
+`instance_id` remains in the case envelope for wire compatibility; a mismatch
+returns `403` and is never stored. Publishers can read shared history across
+all instances in the organization. Reader credentials have the same read scope
+but cannot publish. Admin credentials can issue/revoke credentials and read,
+but cannot publish a caller-selected instance.
+
+`COLLECTIVE_ADMIN_TOKEN` is the separate operator credential. It must be
+strong, kept out of FCAPSule instance configuration, and differ from the
+legacy token. The legacy `COLLECTIVE_API_TOKEN` (or `ESTIMA_API_TOKEN` /
+`ATLAS_API_TOKEN`) remains organization-read capable. It is read-only by
+default because the old deployment-wide token does not identify a publisher.
+For a genuine single-instance migration only, setting
+`COLLECTIVE_LEGACY_INSTANCE_ID` binds that legacy token to exactly one instance
+for publishing; any other payload `instance_id` receives `403`. Do not set this
+to make a shared multi-instance token impersonate several instances. Provision
+per-instance publisher credentials with the admin API and update each
+FCAPSule's existing Collective token setting instead. Until those new
+credentials are issued and FCAPSule clients are rotated, an unbound old token
+can continue reading but its writes will be rejected. Do not deploy the
+access-control revision to an active shared instance before that migration is
+prepared. An environment-bound legacy token is not a managed database key and
+cannot use the self-rotation endpoint; issue a managed publisher key and remove
+the legacy binding to complete that migration.
+
+This release retains the current single-organization deployment model. All
+authenticated readers, including publishers, can inspect cross-instance cases
+and patterns. Credentials do not create organization isolation; do not expose
+one service/database to multiple organizations without adding organization
+ownership to every case, pattern, detail lookup, and mutation first. The admin
+credential is a trusted control-plane boundary: its holder can provision
+publisher credentials for any instance. Audit rows record key IDs, actions,
+instance, role, and time, never bearer secrets.
 
 ## Shared Deployment
 
@@ -117,10 +163,12 @@ Kustomize/apply path: set an approved durable StorageClass and apply them only
 for a new installation with `deploy/kubernetes/estima/install-fresh.sh`.
 Create the `estima-postgres` Secret and `atlas-runtime` Secret through the
 approved secret manager first. The runtime Secret's `DATABASE_URL` must point
-to `estima-postgres` and use database/user `estima`; its
-`COLLECTIVE_API_TOKEN` key may be used for new installs; `ESTIMA_API_TOKEN` and
-`ATLAS_API_TOKEN` remain compatibility fallbacks. Never apply the
-fresh database files over an existing database as a way to rename it.
+to `estima-postgres` and use database/user `estima`. Configure a strong
+`COLLECTIVE_ADMIN_TOKEN` for credential management; retain
+`COLLECTIVE_API_TOKEN` only as a read-compatible legacy key or a deliberately
+single-instance-bound publisher during migration. `ESTIMA_API_TOKEN` and
+`ATLAS_API_TOKEN` remain read-compatible fallbacks. Never apply the fresh
+database files over an existing database as a way to rename it.
 
 `deploy/kubernetes/estima-test/` provides an isolated A/B integration profile
 for the synthetic `fcapsule-atlas-test` database and PVC. Its test cases must

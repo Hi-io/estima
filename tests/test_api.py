@@ -5,15 +5,17 @@ import os
 import uuid
 import unittest
 from copy import deepcopy
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
 from estima.app import create_app
-from estima.repository import InvalidCursor, IdempotencyConflict, _cursor_time_id, _encode_cursor, _search_cursor_key
+from estima.repository import CredentialUnavailable, InvalidCursor, IdempotencyConflict, _cursor_time_id, _encode_cursor, _search_cursor_key
 
 
 TOKEN = "collective-test-token-with-at-least-32-bytes"
+ADMIN_TOKEN = "collective-admin-token-with-at-least-32-bytes"
 
 
 class CursorTests(unittest.TestCase):
@@ -48,12 +50,53 @@ class MemoryRepository:
         self.search_call: dict | None = None
         self.pattern_call: dict | None = None
         self.case_list_call: dict | None = None
+        self.credentials: dict[str, dict] = {}
+        self.credential_audit: list[dict] = []
 
     def migrate(self) -> None:
         pass
 
     def healthcheck(self) -> bool:
         return True
+
+    def authenticate_token(self, secret: str) -> dict | None:
+        now = datetime.now(timezone.utc)
+        credential = next((item for item in self.credentials.values() if item["secret"] == secret), None)
+        if credential is None or credential["revoked"]:
+            return None
+        if credential["valid_until"] is not None and credential["valid_until"] <= now:
+            return None
+        return {key: credential[key] for key in ("key_id", "role", "instance_id")}
+
+    def create_credential(self, *, instance_id: str | None, role: str, actor_key_id: str) -> dict:
+        key_id = str(uuid.uuid4())
+        secret = f"credential-{uuid.uuid4()}"
+        self.credentials[key_id] = {
+            "key_id": key_id, "secret": secret, "role": role, "instance_id": instance_id,
+            "valid_until": None, "revoked": False, "superseded_by": None,
+        }
+        self.credential_audit.append({"action": "credential_issued", "actor_key_id": actor_key_id, "instance_id": instance_id, "role": role})
+        return {"key_id": key_id, "secret": secret, "role": role, "instance_id": instance_id}
+
+    def rotate_credential(self, *, key_id: str, actor_key_id: str, overlap_seconds: int) -> dict:
+        current = self.credentials.get(key_id)
+        if current is None or current["revoked"] or current["superseded_by"]:
+            raise CredentialUnavailable("Credential cannot be rotated")
+        if current["role"] != "publisher" or not current["instance_id"]:
+            raise CredentialUnavailable("Only a publisher credential can be rotated")
+        replacement = self.create_credential(
+            instance_id=current["instance_id"], role=current["role"], actor_key_id=actor_key_id
+        )
+        current["valid_until"] = datetime.now(timezone.utc) + timedelta(seconds=overlap_seconds)
+        current["superseded_by"] = replacement["key_id"]
+        self.credential_audit[-1]["action"] = "credential_rotated"
+        return {**replacement, "old_credential_valid_until": current["valid_until"].isoformat().replace("+00:00", "Z")}
+
+    def revoke_credential(self, *, key_id: str, actor_key_id: str) -> None:
+        credential = self.credentials.get(key_id)
+        if credential and not credential["revoked"]:
+            credential["revoked"] = True
+            self.credential_audit.append({"action": "credential_revoked", "actor_key_id": actor_key_id, "instance_id": credential["instance_id"], "role": credential["role"]})
 
     def create_case(self, case: dict) -> dict:
         key = (case["instance_id"], case["episode_id"], case["revision"])
@@ -140,7 +183,12 @@ def case_payload(**changes) -> dict:
 class CollectiveAPITests(unittest.TestCase):
     def setUp(self) -> None:
         self.repository = MemoryRepository()
-        self.context = TestClient(create_app(repository=self.repository, token=TOKEN))
+        self.context = TestClient(create_app(
+            repository=self.repository,
+            token=TOKEN,
+            admin_token=ADMIN_TOKEN,
+            legacy_instance_id="site-alpha",
+        ))
         self.client = self.context.__enter__()
         self.headers = {"Authorization": f"Bearer {TOKEN}"}
 
@@ -157,6 +205,59 @@ class CollectiveAPITests(unittest.TestCase):
         response = self.client.post("/v1/search", json={})
         self.assertEqual(response.status_code, 401)
         self.assertEqual(response.headers["www-authenticate"], "Bearer")
+
+    def test_unbound_legacy_token_is_read_only(self) -> None:
+        with TestClient(create_app(repository=MemoryRepository(), token=TOKEN)) as client:
+            self.assertEqual(client.get("/v1/stats", headers=self.headers).status_code, 200)
+            response = client.post("/v1/cases", json=case_payload(), headers=self.headers)
+        self.assertEqual(response.status_code, 403)
+
+    def test_reader_cannot_mutate_and_publisher_is_bound_but_reads_across_instances(self) -> None:
+        admin_headers = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
+        reader_issue = self.client.post("/v1/admin/reader-credentials", headers=admin_headers)
+        publisher_issue = self.client.post(
+            "/v1/admin/instances/site-beta/publisher-credentials", headers=admin_headers
+        )
+        self.assertEqual(reader_issue.status_code, 201)
+        self.assertEqual(publisher_issue.status_code, 201)
+
+        reader_headers = {"Authorization": f"Bearer {reader_issue.json()['secret']}"}
+        beta_headers = {"Authorization": f"Bearer {publisher_issue.json()['secret']}"}
+        self.assertEqual(self.client.post("/v1/cases", json=case_payload(instance_id="site-beta"), headers=reader_headers).status_code, 403)
+        self.assertEqual(self.client.post("/v1/cases", json=case_payload(instance_id="site-beta"), headers=self.headers).status_code, 403)
+        self.assertEqual(self.client.post("/v1/cases", json=case_payload(instance_id="site-beta"), headers=admin_headers).status_code, 403)
+
+        with TestClient(create_app(repository=self.repository, admin_token=ADMIN_TOKEN)) as beta_client:
+            published = beta_client.post("/v1/cases", json=case_payload(instance_id="site-beta"), headers=beta_headers)
+        self.assertEqual(published.status_code, 201)
+        cross_instance_read = self.client.get(f"/v1/cases/{published.json()['case']['id']}", headers=self.headers)
+        self.assertEqual(cross_instance_read.status_code, 200)
+        self.assertEqual(cross_instance_read.json()["case"]["instance_id"], "site-beta")
+
+        revoked = self.client.delete(
+            f"/v1/admin/credentials/{publisher_issue.json()['key_id']}",
+            headers=admin_headers,
+        )
+        self.assertEqual(revoked.status_code, 204)
+        self.assertEqual(self.client.get("/v1/stats", headers=beta_headers).status_code, 401)
+
+    def test_rotation_preserves_scope_and_revokes_old_key_after_overlap(self) -> None:
+        issued = self.client.post(
+            "/v1/admin/instances/site-beta/publisher-credentials",
+            headers={"Authorization": f"Bearer {ADMIN_TOKEN}"},
+        )
+        old_secret = issued.json()["secret"]
+        old_headers = {"Authorization": f"Bearer {old_secret}"}
+        with TestClient(create_app(repository=self.repository, admin_token=ADMIN_TOKEN, credential_overlap_seconds=30)) as client:
+            rotated = client.post("/v1/credentials/rotate", headers=old_headers)
+            self.assertEqual(rotated.status_code, 201)
+            new_headers = {"Authorization": f"Bearer {rotated.json()['secret']}"}
+            self.assertEqual(client.get("/v1/stats", headers=old_headers).status_code, 200)
+            self.assertEqual(client.get("/v1/stats", headers=new_headers).status_code, 200)
+            self.assertEqual(client.post("/v1/credentials/rotate", headers=old_headers).status_code, 409)
+            self.repository.credentials[issued.json()["key_id"]]["valid_until"] = datetime.now(timezone.utc) - timedelta(seconds=1)
+            self.assertEqual(client.get("/v1/stats", headers=old_headers).status_code, 401)
+            self.assertEqual(client.post("/v1/cases", json=case_payload(instance_id="site-beta"), headers=new_headers).status_code, 201)
 
     def test_collective_token_is_preferred_and_legacy_tokens_remain_compatible(self) -> None:
         old_token = "old-estima-token-value-long-enough"
