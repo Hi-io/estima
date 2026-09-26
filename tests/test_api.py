@@ -11,7 +11,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from estima.app import create_app
-from estima.repository import CredentialUnavailable, InvalidCursor, IdempotencyConflict, _cursor_time_id, _encode_cursor, _search_cursor_key
+from estima.repository import CredentialUnavailable, EpisodeUnavailable, InvalidCursor, IdempotencyConflict, _cursor_time_id, _encode_cursor, _search_cursor_key
 
 
 TOKEN = "collective-test-token-with-at-least-32-bytes"
@@ -52,6 +52,8 @@ class MemoryRepository:
         self.case_list_call: dict | None = None
         self.credentials: dict[str, dict] = {}
         self.credential_audit: list[dict] = []
+        self.tombstones: set[tuple[str, str]] = set()
+        self.lifecycle_audit: list[dict] = []
 
     def migrate(self) -> None:
         pass
@@ -100,6 +102,8 @@ class MemoryRepository:
 
     def create_case(self, case: dict) -> dict:
         key = (case["instance_id"], case["episode_id"], case["revision"])
+        if key[:2] in self.tombstones:
+            raise EpisodeUnavailable("This episode is no longer available")
         existing = self.cases.get(key)
         if existing:
             if any(existing[name] != value for name, value in case.items()):
@@ -108,6 +112,20 @@ class MemoryRepository:
         stored = {**deepcopy(case), "id": str(uuid.uuid4())}
         self.cases[key] = stored
         return {"case": deepcopy(stored), "created": True}
+
+    def withdraw_episode(self, *, instance_id: str, episode_id: str, actor_key_id: str) -> int:
+        key = (instance_id, episode_id)
+        deleted = [case_key for case_key in self.cases if case_key[:2] == key]
+        for case_key in deleted:
+            del self.cases[case_key]
+        if key not in self.tombstones:
+            self.tombstones.add(key)
+            self.lifecycle_audit.append({
+                "action": "episode_withdrawn", "actor_key_id": actor_key_id,
+                "instance_id": instance_id, "episode_id": episode_id,
+                "deleted_case_count": len(deleted),
+            })
+        return len(deleted)
 
     def get_case(self, case_id: str) -> dict | None:
         return next((deepcopy(case) for case in self.cases.values() if case["id"] == case_id), None)
@@ -297,6 +315,38 @@ class CollectiveAPITests(unittest.TestCase):
         detail = self.client.get(f"/v1/cases/{case['id']}", headers=self.headers)
         self.assertEqual(detail.status_code, 200)
         self.assertEqual(detail.json()["case"], case)
+
+    def test_episode_withdrawal_is_owner_bound_idempotent_and_blocks_retries(self) -> None:
+        admin_headers = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
+        reader = self.client.post("/v1/admin/reader-credentials", headers=admin_headers)
+        reader_headers = {"Authorization": f"Bearer {reader.json()['secret']}"}
+        first = self.client.post("/v1/cases", json=case_payload(), headers=self.headers).json()["case"]
+        second = self.client.post(
+            "/v1/cases", json=case_payload(revision=2), headers=self.headers
+        ).json()["case"]
+
+        issued = self.client.post(
+            "/v1/admin/instances/site-bravo/publisher-credentials", headers=admin_headers
+        ).json()
+        bravo_headers = {"Authorization": f"Bearer {issued['secret']}"}
+        remote = self.client.post(
+            "/v1/cases", json=case_payload(instance_id="site-bravo"), headers=bravo_headers
+        ).json()["case"]
+
+        self.assertEqual(self.client.delete("/v1/episodes/episode-17", headers=reader_headers).status_code, 403)
+        withdrawn = self.client.delete("/v1/episodes/episode-17", headers=self.headers)
+        repeated = self.client.delete("/v1/episodes/episode-17", headers=self.headers)
+        self.assertEqual(withdrawn.status_code, 204)
+        self.assertEqual(repeated.status_code, 204)
+        self.assertEqual(self.client.get(f"/v1/cases/{first['id']}", headers=self.headers).status_code, 404)
+        self.assertEqual(self.client.get(f"/v1/cases/{second['id']}", headers=self.headers).status_code, 404)
+        self.assertEqual(self.client.get(f"/v1/cases/{remote['id']}", headers=self.headers).status_code, 200)
+
+        retry = self.client.post("/v1/cases", json=case_payload(), headers=self.headers)
+        self.assertEqual(retry.status_code, 410)
+        self.assertEqual(self.repository.stats(), {"episodes": 1, "revisions": 1, "patterns": 1})
+        self.assertEqual(len(self.repository.lifecycle_audit), 1)
+        self.assertEqual(self.repository.lifecycle_audit[0]["deleted_case_count"], 2)
 
     def test_stats_count_episodes_revisions_and_distinct_latest_patterns(self) -> None:
         memory_observation = [{"kind": "metric", "key": "Memory", "value": 7, "unit": "count"}]

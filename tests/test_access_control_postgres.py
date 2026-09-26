@@ -62,6 +62,8 @@ class PostgresAccessControlAcceptanceTests(unittest.TestCase):
                     (key_id, key_id),
                 )
             conn.execute("DELETE FROM atlas_cases WHERE instance_id LIKE %s", (f"{self.prefix}%",))
+            conn.execute("DELETE FROM atlas_episode_tombstones WHERE instance_id LIKE %s", (f"{self.prefix}%",))
+            conn.execute("DELETE FROM atlas_case_lifecycle_audit WHERE instance_id LIKE %s", (f"{self.prefix}%",))
             conn.execute("DELETE FROM atlas_credential_audit WHERE instance_id LIKE %s", (f"{self.prefix}%",))
 
     def issue_publisher(self, instance_id: str) -> dict:
@@ -201,6 +203,97 @@ class PostgresAccessControlAcceptanceTests(unittest.TestCase):
         self.assertEqual(stored_hash, hashlib.sha256(replacement["secret"].encode("utf-8")).digest())
         self.assertNotIn(old["secret"], str(audit))
         self.assertNotIn(replacement["secret"], str(audit))
+
+    def test_publisher_withdrawal_is_instance_bound_and_excludes_shared_retrieval(self) -> None:
+        alpha = f"{self.prefix}-withdraw-alpha"
+        bravo = f"{self.prefix}-withdraw-bravo"
+        charlie = f"{self.prefix}-withdraw-charlie"
+        alpha_credential = self.issue_publisher(alpha)
+        bravo_credential = self.issue_publisher(bravo)
+        charlie_credential = self.issue_publisher(charlie)
+        reader_credential = self.issue_reader()
+        alpha_headers = self.headers(alpha_credential["secret"])
+        bravo_headers = self.headers(bravo_credential["secret"])
+        charlie_headers = self.headers(charlie_credential["secret"])
+        reader_headers = self.headers(reader_credential["secret"])
+        shared_episode = "same-episode-id"
+
+        alpha_first = self.client.post(
+            "/v1/cases", json=payload(alpha, shared_episode, self.cluster, self.pattern_key), headers=alpha_headers
+        )
+        alpha_second = self.client.post(
+            "/v1/cases", json=payload(alpha, shared_episode, self.cluster, self.pattern_key, revision=2), headers=alpha_headers
+        )
+        bravo_case = self.client.post(
+            "/v1/cases", json=payload(bravo, shared_episode, self.cluster, self.pattern_key), headers=bravo_headers
+        )
+        charlie_case = self.client.post(
+            "/v1/cases", json=payload(charlie, shared_episode, self.cluster, self.pattern_key), headers=charlie_headers
+        )
+        for response in (alpha_first, alpha_second, bravo_case, charlie_case):
+            self.assertEqual(response.status_code, 201, response.text)
+
+        denied = self.client.delete(f"/v1/episodes/{shared_episode}", headers=reader_headers)
+        self.assertEqual(denied.status_code, 403)
+        withdrawal = self.client.delete(f"/v1/episodes/{shared_episode}", headers=alpha_headers)
+        repeated = self.client.delete(f"/v1/episodes/{shared_episode}", headers=alpha_headers)
+        self.assertEqual(withdrawal.status_code, 204)
+        self.assertEqual(repeated.status_code, 204)
+        retry = self.client.post(
+            "/v1/cases", json=payload(alpha, shared_episode, self.cluster, self.pattern_key), headers=alpha_headers
+        )
+        self.assertEqual(retry.status_code, 410)
+        self.assertEqual(
+            self.client.get(f"/v1/cases/{alpha_first.json()['case']['id']}", headers=reader_headers).status_code,
+            404,
+        )
+        self.assertEqual(
+            self.client.get(f"/v1/cases/{alpha_second.json()['case']['id']}", headers=reader_headers).status_code,
+            404,
+        )
+
+        search = self.client.post(
+            "/v1/search", json={"instance_id": alpha, "scope": {"cluster": self.cluster}}, headers=reader_headers
+        )
+        self.assertEqual(search.status_code, 200)
+        self.assertEqual(search.json()["cases"], [])
+        pattern = self.client.get(
+            "/v1/patterns", params={"cluster": self.cluster}, headers=reader_headers
+        )
+        self.assertEqual(pattern.status_code, 200)
+        shared_pattern = next(item for item in pattern.json()["patterns"] if item["key"] == self.pattern_key.replace("-", "_"))
+        self.assertEqual(shared_pattern["case_count"], 2)
+        detail = self.client.get(f"/v1/patterns/{shared_pattern['id']}", headers=reader_headers)
+        self.assertEqual(
+            {case["instance_id"] for case in detail.json()["cases"]},
+            {bravo, charlie},
+        )
+        self.assertEqual(
+            self.client.get(f"/v1/cases/{bravo_case.json()['case']['id']}", headers=reader_headers).status_code,
+            200,
+        )
+        self.assertEqual(
+            self.client.get(f"/v1/cases/{charlie_case.json()['case']['id']}", headers=reader_headers).status_code,
+            200,
+        )
+
+        with self.repository._connect() as conn:
+            tombstone = conn.execute(
+                "SELECT reason, actor_key_id FROM atlas_episode_tombstones "
+                "WHERE instance_id = %s AND episode_id = %s",
+                (alpha, shared_episode),
+            ).fetchone()
+            audit = conn.execute(
+                "SELECT actor_key_id, action, deleted_case_count FROM atlas_case_lifecycle_audit "
+                "WHERE instance_id = %s AND episode_id = %s",
+                (alpha, shared_episode),
+            ).fetchall()
+        self.assertEqual(tombstone["reason"], "publisher")
+        self.assertEqual(tombstone["actor_key_id"], alpha_credential["key_id"])
+        self.assertEqual(len(audit), 1)
+        self.assertEqual(audit[0]["actor_key_id"], alpha_credential["key_id"])
+        self.assertEqual(audit[0]["action"], "episode_withdrawn")
+        self.assertEqual(audit[0]["deleted_case_count"], 2)
 
     def test_unbound_legacy_token_is_read_only_and_remains_org_reader(self) -> None:
         instance_id = f"{self.prefix}-legacy"

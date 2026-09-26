@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 from estima.normalize import normalize_case, observation_pattern_id
-from estima.repository import IdempotencyConflict, PostgresEstimaRepository
+from estima.repository import EpisodeUnavailable, IdempotencyConflict, PostgresEstimaRepository
 
 
 DSN = (
@@ -42,6 +42,8 @@ class PostgresRepositoryTests(unittest.TestCase):
     def tearDown(self) -> None:
         with self.repo._connect() as conn:
             conn.execute("DELETE FROM atlas_cases WHERE instance_id LIKE %s", (f"{self.prefix}%",))
+            conn.execute("DELETE FROM atlas_episode_tombstones WHERE instance_id LIKE %s", (f"{self.prefix}%",))
+            conn.execute("DELETE FROM atlas_case_lifecycle_audit WHERE instance_id LIKE %s", (f"{self.prefix}%",))
 
     def add_case(self, episode: str, revision: int, at: datetime, observation: tuple[str, str, int], fingerprint: str | None = None, instance_suffix: str = "a") -> dict:
         case = normalize_case(payload(f"{self.prefix}-{instance_suffix}", episode, revision, at, observation, fingerprint))
@@ -64,6 +66,46 @@ class PostgresRepositoryTests(unittest.TestCase):
         self.assertNotEqual(first["case"]["id"], second["id"])
         self.assertEqual(self.repo.get_case(first["case"]["id"])["revision"], 1)
         self.assertEqual(self.repo.get_case(second["id"])["revision"], 2)
+
+    def test_retention_expires_inactive_episodes_and_prevents_old_retries(self) -> None:
+        now = datetime.now(timezone.utc)
+        old_first = self.add_case("expired", 1, now, ("metric", "legacy", 1))
+        old_latest = self.add_case("expired", 2, now + timedelta(seconds=1), ("metric", "shared", 7))
+        retained = self.add_case("retained", 1, now + timedelta(seconds=2), ("metric", "shared", 7))
+        with self.repo._connect() as conn:
+            conn.execute(
+                "UPDATE atlas_cases SET created_at = clock_timestamp() - interval '2 days' "
+                "WHERE instance_id = %s AND episode_id = %s",
+                (f"{self.prefix}-a", "expired"),
+            )
+
+        deleted = self.repo.purge_expired_cases(retention_days=1)
+
+        self.assertEqual(deleted, 2)
+        self.assertIsNone(self.repo.get_case(old_first["id"]))
+        self.assertIsNone(self.repo.get_case(old_latest["id"]))
+        self.assertEqual(self.repo.get_case(retained["id"])["id"], retained["id"])
+        result = self.repo.search(instance_id=f"{self.prefix}-a", query="shared", limit=10)
+        self.assertEqual([case["episode_id"] for case in result["cases"]], ["retained"])
+        self.assertEqual(self.repo.list_patterns(scope={"cluster": self.cluster})["patterns"], [])
+        with self.assertRaises(EpisodeUnavailable):
+            self.add_case("expired", 1, now, ("metric", "legacy", 1))
+
+        with self.repo._connect() as conn:
+            tombstone = conn.execute(
+                "SELECT reason, actor_key_id FROM atlas_episode_tombstones "
+                "WHERE instance_id = %s AND episode_id = 'expired'",
+                (f"{self.prefix}-a",),
+            ).fetchone()
+            audit = conn.execute(
+                "SELECT action, deleted_case_count, retention_days FROM atlas_case_lifecycle_audit "
+                "WHERE instance_id = %s AND episode_id = 'expired'",
+                (f"{self.prefix}-a",),
+            ).fetchone()
+        self.assertEqual(tombstone, {"reason": "retention", "actor_key_id": "system-retention"})
+        self.assertEqual(audit["action"], "episode_retention_expired")
+        self.assertEqual(audit["deleted_case_count"], 2)
+        self.assertEqual(audit["retention_days"], 1)
 
     def test_patterns_count_latest_revision_once_and_expose_cooccurrence_only(self) -> None:
         now = datetime.now(timezone.utc)
