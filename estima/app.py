@@ -4,23 +4,33 @@ import hmac
 import json
 import logging
 import os
+from dataclasses import dataclass
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any, Callable
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
+from fastapi import Depends, FastAPI, HTTPException, Path, Query, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope as ASGIScope, Send
 
 from .models import CaseEnvelope, SearchRequest
-from .normalize import UnsafeCase, normalize_case, normalize_fingerprint, normalize_scope_filter
-from .repository import IdempotencyConflict, InvalidCursor, PostgresEstimaRepository
+from .normalize import UnsafeCase, normalize_case, normalize_fingerprint, normalize_instance_id, normalize_scope_filter
+from .repository import CredentialUnavailable, IdempotencyConflict, InvalidCursor, PostgresEstimaRepository
 
 
 logger = logging.getLogger("estima")
 MAX_BODY_BYTES = 40 * 1024
 MIN_TOKEN_BYTES = 24
+DEFAULT_CREDENTIAL_OVERLAP_SECONDS = 300
+MAX_CREDENTIAL_OVERLAP_SECONDS = 3600
+
+
+@dataclass(frozen=True)
+class Principal:
+    key_id: str
+    role: str
+    instance_id: str | None = None
 
 
 class MaxBodySizeMiddleware:
@@ -72,8 +82,18 @@ class MaxBodySizeMiddleware:
         await send({"type": "http.response.body", "body": body})
 
 
-def create_app(repository: Any | None = None, token: str | None = None) -> FastAPI:
+def create_app(
+    repository: Any | None = None,
+    token: str | None = None,
+    *,
+    admin_token: str | None = None,
+    legacy_instance_id: str | None = None,
+    credential_overlap_seconds: int | None = None,
+) -> FastAPI:
     configured_token = token
+    configured_admin_token = admin_token
+    configured_legacy_instance_id = legacy_instance_id
+    configured_overlap_seconds = credential_overlap_seconds
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -83,9 +103,35 @@ def create_app(repository: Any | None = None, token: str | None = None) -> FastA
             or os.environ.get("ESTIMA_API_TOKEN")
             or os.environ.get("ATLAS_API_TOKEN")
         )
-        if actual_token is None or len(actual_token.encode("utf-8")) < MIN_TOKEN_BYTES:
-            raise RuntimeError("COLLECTIVE_API_TOKEN must contain at least 24 bytes")
+        actual_admin_token = configured_admin_token or os.environ.get("COLLECTIVE_ADMIN_TOKEN")
+        instance_id = configured_legacy_instance_id or os.environ.get("COLLECTIVE_LEGACY_INSTANCE_ID")
+        if actual_token is None and actual_admin_token is None:
+            raise RuntimeError("COLLECTIVE_API_TOKEN or COLLECTIVE_ADMIN_TOKEN must be configured")
+        for name, candidate in (("COLLECTIVE_API_TOKEN", actual_token), ("COLLECTIVE_ADMIN_TOKEN", actual_admin_token)):
+            if candidate is not None and len(candidate.encode("utf-8")) < MIN_TOKEN_BYTES:
+                raise RuntimeError(f"{name} must contain at least 24 bytes")
+        if actual_token and actual_admin_token and hmac.compare_digest(
+            actual_token.encode("utf-8"), actual_admin_token.encode("utf-8")
+        ):
+            raise RuntimeError("COLLECTIVE_ADMIN_TOKEN must differ from COLLECTIVE_API_TOKEN")
+        if instance_id is not None:
+            try:
+                instance_id = normalize_instance_id(instance_id)
+            except UnsafeCase as exc:
+                raise RuntimeError("COLLECTIVE_LEGACY_INSTANCE_ID is invalid") from exc
+        overlap_seconds = configured_overlap_seconds
+        if overlap_seconds is None:
+            raw_overlap = os.environ.get("COLLECTIVE_CREDENTIAL_OVERLAP_SECONDS")
+            try:
+                overlap_seconds = int(raw_overlap) if raw_overlap is not None else DEFAULT_CREDENTIAL_OVERLAP_SECONDS
+            except ValueError:
+                raise RuntimeError("COLLECTIVE_CREDENTIAL_OVERLAP_SECONDS must be an integer") from None
+        if not 0 <= overlap_seconds <= MAX_CREDENTIAL_OVERLAP_SECONDS:
+            raise RuntimeError("COLLECTIVE_CREDENTIAL_OVERLAP_SECONDS must be between 0 and 3600")
         app.state.token = actual_token
+        app.state.admin_token = actual_admin_token
+        app.state.legacy_instance_id = instance_id
+        app.state.credential_overlap_seconds = overlap_seconds
         app.state.repository = repository
         if app.state.repository is None:
             app.state.repository = PostgresEstimaRepository()
@@ -105,21 +151,55 @@ def create_app(repository: Any | None = None, token: str | None = None) -> FastA
         errors = [{"loc": error.get("loc", []), "msg": error.get("msg", "Invalid value"), "type": error.get("type", "value_error")} for error in exc.errors()]
         return JSONResponse(status_code=422, content={"detail": errors})
 
-    def require_token(request: Request) -> None:
-        expected = getattr(request.app.state, "token", None)
-        if not expected:
+    def authenticate(request: Request) -> Principal:
+        legacy_token = getattr(request.app.state, "token", None)
+        admin_token_value = getattr(request.app.state, "admin_token", None)
+        if not legacy_token and not admin_token_value:
             raise HTTPException(status_code=503, detail="Collective is not configured")
         authorization = request.headers.get("authorization", "")
         scheme, _, supplied = authorization.partition(" ")
         valid = scheme.casefold() == "bearer" and bool(supplied)
-        if valid:
-            valid = hmac.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8"))
+        supplied_bytes = supplied.encode("utf-8") if valid else b""
+        if valid and admin_token_value and hmac.compare_digest(
+            supplied_bytes, admin_token_value.encode("utf-8")
+        ):
+            return Principal(key_id="environment-admin", role="admin")
+        if valid and legacy_token and hmac.compare_digest(
+            supplied_bytes, legacy_token.encode("utf-8")
+        ):
+            instance_id = getattr(request.app.state, "legacy_instance_id", None)
+            return Principal(
+                key_id="environment-legacy",
+                role="publisher" if instance_id else "reader",
+                instance_id=instance_id,
+            )
         if not valid:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="A valid bearer token is required",
                 headers={"WWW-Authenticate": "Bearer"},
             )
+        credential = call_repository(repo(request).authenticate_token, supplied)
+        if credential is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="A valid bearer token is required",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        return Principal(**credential)
+
+    def require_reader(principal: Principal = Depends(authenticate)) -> Principal:
+        return principal
+
+    def require_publisher(principal: Principal = Depends(authenticate)) -> Principal:
+        if principal.role != "publisher" or not principal.instance_id:
+            raise HTTPException(status_code=403, detail="A publisher credential is required")
+        return principal
+
+    def require_admin(principal: Principal = Depends(authenticate)) -> Principal:
+        if principal.role != "admin":
+            raise HTTPException(status_code=403, detail="An admin credential is required")
+        return principal
 
     def repo(request: Request) -> Any:
         instance = getattr(request.app.state, "repository", None)
@@ -134,6 +214,8 @@ def create_app(repository: Any | None = None, token: str | None = None) -> FastA
             raise HTTPException(status_code=409, detail=str(exc)) from None
         except InvalidCursor as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from None
+        except CredentialUnavailable as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from None
         except HTTPException:
             raise
         except Exception as exc:
@@ -152,20 +234,26 @@ def create_app(repository: Any | None = None, token: str | None = None) -> FastA
             return JSONResponse(status_code=503, content={"status": "unavailable"})
         return JSONResponse(content={"status": "ok"})
 
-    @app.post("/v1/cases", status_code=201, dependencies=[Depends(require_token)])
-    def create_case(envelope: CaseEnvelope, request: Request) -> JSONResponse:
+    @app.post("/v1/cases", status_code=201)
+    def create_case(
+        envelope: CaseEnvelope,
+        request: Request,
+        principal: Principal = Depends(require_publisher),
+    ) -> JSONResponse:
         try:
             case = normalize_case(envelope)
         except UnsafeCase as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from None
+        if case["instance_id"] != principal.instance_id:
+            raise HTTPException(status_code=403, detail="Case instance_id does not match the publisher credential")
         result = call_repository(repo(request).create_case, case)
         return JSONResponse(status_code=201 if result["created"] else 200, content=result)
 
-    @app.get("/v1/stats", dependencies=[Depends(require_token)])
+    @app.get("/v1/stats", dependencies=[Depends(require_reader)])
     def stats(request: Request) -> dict[str, int]:
         return call_repository(repo(request).stats)
 
-    @app.get("/v1/cases", dependencies=[Depends(require_token)])
+    @app.get("/v1/cases", dependencies=[Depends(require_reader)])
     def list_cases(
         request: Request,
         limit: int = Query(default=20, ge=1, le=50),
@@ -210,14 +298,14 @@ def create_app(repository: Any | None = None, token: str | None = None) -> FastA
             cursor=cursor,
         )
 
-    @app.get("/v1/cases/{case_id}", dependencies=[Depends(require_token)])
+    @app.get("/v1/cases/{case_id}", dependencies=[Depends(require_reader)])
     def get_case(case_id: str, request: Request) -> dict[str, Any]:
         result = call_repository(repo(request).get_case, case_id)
         if result is None:
             raise HTTPException(status_code=404, detail="Case not found")
         return {"case": result}
 
-    @app.post("/v1/search", dependencies=[Depends(require_token)])
+    @app.post("/v1/search", dependencies=[Depends(require_reader)])
     def search(body: SearchRequest, request: Request) -> dict[str, Any]:
         if body.before and body.observed_before and body.before != body.observed_before:
             raise HTTPException(status_code=422, detail="before and observed_before must match when both are supplied")
@@ -238,7 +326,7 @@ def create_app(repository: Any | None = None, token: str | None = None) -> FastA
             cursor=body.cursor,
         )
 
-    @app.get("/v1/patterns", dependencies=[Depends(require_token)])
+    @app.get("/v1/patterns", dependencies=[Depends(require_reader)])
     def list_patterns(
         request: Request,
         scope: str | None = Query(default=None),
@@ -289,12 +377,63 @@ def create_app(repository: Any | None = None, token: str | None = None) -> FastA
             limit=limit,
         )
 
-    @app.get("/v1/patterns/{pattern_id}", dependencies=[Depends(require_token)])
+    @app.get("/v1/patterns/{pattern_id}", dependencies=[Depends(require_reader)])
     def get_pattern(pattern_id: str, request: Request) -> dict[str, Any]:
         result = call_repository(repo(request).get_pattern, pattern_id)
         if result is None:
             raise HTTPException(status_code=404, detail="Pattern not found")
         return result
+
+    @app.post("/v1/admin/instances/{instance_id}/publisher-credentials", status_code=201)
+    def issue_publisher_credential(
+        request: Request,
+        instance_id: str = Path(min_length=1, max_length=128),
+        principal: Principal = Depends(require_admin),
+    ) -> dict[str, Any]:
+        try:
+            bound_instance_id = normalize_instance_id(instance_id)
+        except UnsafeCase as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from None
+        credential = call_repository(
+            repo(request).create_credential,
+            instance_id=bound_instance_id,
+            role="publisher",
+            actor_key_id=principal.key_id,
+        )
+        return credential
+
+    @app.post("/v1/admin/reader-credentials", status_code=201)
+    def issue_reader_credential(
+        request: Request,
+        principal: Principal = Depends(require_admin),
+    ) -> dict[str, Any]:
+        return call_repository(
+            repo(request).create_credential,
+            instance_id=None,
+            role="reader",
+            actor_key_id=principal.key_id,
+        )
+
+    @app.post("/v1/credentials/rotate", status_code=201)
+    def rotate_credential(
+        request: Request,
+        principal: Principal = Depends(require_publisher),
+    ) -> dict[str, Any]:
+        return call_repository(
+            repo(request).rotate_credential,
+            key_id=principal.key_id,
+            actor_key_id=principal.key_id,
+            overlap_seconds=request.app.state.credential_overlap_seconds,
+        )
+
+    @app.delete("/v1/admin/credentials/{key_id}", status_code=204)
+    def revoke_credential(
+        key_id: str,
+        request: Request,
+        principal: Principal = Depends(require_admin),
+    ) -> None:
+        call_repository(repo(request).revoke_credential, key_id=key_id, actor_key_id=principal.key_id)
+        return None
 
     return app
 

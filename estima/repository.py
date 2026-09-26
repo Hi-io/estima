@@ -7,6 +7,7 @@ import json
 import math
 import os
 import re
+import secrets
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,6 +28,10 @@ class IdempotencyConflict(ValueError):
 
 
 class InvalidCursor(ValueError):
+    pass
+
+
+class CredentialUnavailable(ValueError):
     pass
 
 
@@ -133,6 +138,126 @@ class PostgresEstimaRepository:
         with self._connect() as conn:
             conn.execute("SELECT 1 FROM atlas_schema_migrations LIMIT 1").fetchone()
         return True
+
+    @staticmethod
+    def _credential_digest(secret: str) -> bytes:
+        return hashlib.sha256(secret.encode("utf-8")).digest()
+
+    def authenticate_token(self, secret: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """SELECT key_id, role, instance_id FROM atlas_api_credentials
+                   WHERE secret_hash = %s AND revoked_at IS NULL
+                     AND (valid_until IS NULL OR valid_until > clock_timestamp())""",
+                (self._credential_digest(secret),),
+            ).fetchone()
+        if row is None:
+            return None
+        return {"key_id": str(row["key_id"]), "role": row["role"], "instance_id": row["instance_id"]}
+
+    def create_credential(
+        self,
+        *,
+        instance_id: str | None,
+        role: str,
+        actor_key_id: str,
+    ) -> dict[str, Any]:
+        if role not in {"publisher", "reader"} or (role == "publisher") != (instance_id is not None):
+            raise ValueError("Invalid credential role or instance binding")
+        key_id = uuid.uuid4()
+        secret = secrets.token_urlsafe(32)
+        with self._connect() as conn:
+            conn.execute(
+                """INSERT INTO atlas_api_credentials (key_id, secret_hash, role, instance_id)
+                   VALUES (%s, %s, %s, %s)""",
+                (key_id, self._credential_digest(secret), role, instance_id),
+            )
+            conn.execute(
+                """INSERT INTO atlas_credential_audit
+                   (actor_key_id, action, subject_key_id, instance_id, role)
+                   VALUES (%s, 'credential_issued', %s, %s, %s)""",
+                (actor_key_id, key_id, instance_id, role),
+            )
+        return {
+            "key_id": str(key_id),
+            "secret": secret,
+            "role": role,
+            "instance_id": instance_id,
+        }
+
+    def rotate_credential(
+        self,
+        *,
+        key_id: str,
+        actor_key_id: str,
+        overlap_seconds: int,
+    ) -> dict[str, Any]:
+        try:
+            old_key_id = uuid.UUID(key_id)
+        except (ValueError, AttributeError):
+            raise CredentialUnavailable("Credential cannot be rotated") from None
+        new_key_id = uuid.uuid4()
+        secret = secrets.token_urlsafe(32)
+        with self._connect() as conn:
+            current = conn.execute(
+                """SELECT role, instance_id, superseded_by FROM atlas_api_credentials
+                   WHERE key_id = %s AND revoked_at IS NULL
+                     AND (valid_until IS NULL OR valid_until > clock_timestamp())
+                   FOR UPDATE""",
+                (old_key_id,),
+            ).fetchone()
+            if current is None or current["superseded_by"] is not None:
+                raise CredentialUnavailable("Credential cannot be rotated")
+            if current["role"] != "publisher" or not current["instance_id"]:
+                raise CredentialUnavailable("Only a publisher credential can be rotated")
+            overlap_until = conn.execute(
+                "SELECT clock_timestamp() + (%s * interval '1 second') AS value",
+                (overlap_seconds,),
+            ).fetchone()["value"]
+            conn.execute(
+                """INSERT INTO atlas_api_credentials (key_id, secret_hash, role, instance_id)
+                   VALUES (%s, %s, %s, %s)""",
+                (new_key_id, self._credential_digest(secret), current["role"], current["instance_id"]),
+            )
+            conn.execute(
+                """UPDATE atlas_api_credentials
+                   SET valid_until = %s, superseded_by = %s WHERE key_id = %s""",
+                (overlap_until, new_key_id, old_key_id),
+            )
+            conn.execute(
+                """INSERT INTO atlas_credential_audit
+                   (actor_key_id, action, subject_key_id, related_key_id, instance_id, role, overlap_until)
+                   VALUES (%s, 'credential_rotated', %s, %s, %s, %s, %s)""",
+                (actor_key_id, new_key_id, old_key_id, current["instance_id"], current["role"], overlap_until),
+            )
+        return {
+            "key_id": str(new_key_id),
+            "secret": secret,
+            "role": current["role"],
+            "instance_id": current["instance_id"],
+            "old_credential_valid_until": overlap_until.isoformat().replace("+00:00", "Z"),
+        }
+
+    def revoke_credential(self, *, key_id: str, actor_key_id: str) -> None:
+        try:
+            parsed_key_id = uuid.UUID(key_id)
+        except (ValueError, AttributeError):
+            return
+        with self._connect() as conn:
+            row = conn.execute(
+                """UPDATE atlas_api_credentials
+                   SET revoked_at = clock_timestamp(), valid_until = clock_timestamp()
+                   WHERE key_id = %s AND revoked_at IS NULL
+                   RETURNING instance_id, role""",
+                (parsed_key_id,),
+            ).fetchone()
+            if row is not None:
+                conn.execute(
+                    """INSERT INTO atlas_credential_audit
+                       (actor_key_id, action, subject_key_id, instance_id, role)
+                       VALUES (%s, 'credential_revoked', %s, %s, %s)""",
+                    (actor_key_id, parsed_key_id, row["instance_id"], row["role"]),
+                )
 
     def stats(self) -> dict[str, int]:
         with self._connect() as conn:
