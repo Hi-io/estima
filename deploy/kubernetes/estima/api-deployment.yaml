@@ -38,6 +38,12 @@ spec:
                 secretKeyRef:
                   name: atlas-runtime
                   key: DATABASE_URL
+            - name: COLLECTIVE_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: atlas-runtime
+                  key: COLLECTIVE_API_TOKEN
+                  optional: true
             - name: ESTIMA_API_TOKEN
               valueFrom:
                 secretKeyRef:

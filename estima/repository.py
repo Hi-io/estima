@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import json
+import math
 import os
 import re
 import uuid
@@ -21,6 +24,53 @@ TOKEN_RE = re.compile(r"[a-z0-9_]+")
 
 class IdempotencyConflict(ValueError):
     pass
+
+
+class InvalidCursor(ValueError):
+    pass
+
+
+def _encode_cursor(value: dict[str, Any]) -> str:
+    data = json.dumps(value, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
+
+
+def _decode_cursor(cursor: str, kind: str) -> dict[str, Any]:
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,256}", cursor):
+        raise InvalidCursor("Invalid pagination cursor")
+    try:
+        raw = base64.b64decode(cursor + "=" * (-len(cursor) % 4), altchars=b"-_", validate=True)
+        value = json.loads(raw)
+    except (binascii.Error, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        raise InvalidCursor("Invalid pagination cursor") from None
+    if not isinstance(value, dict) or value.get("kind") != kind:
+        raise InvalidCursor("Invalid pagination cursor")
+    return value
+
+
+def _cursor_time_id(cursor: str, kind: str) -> tuple[datetime, uuid.UUID]:
+    value = _decode_cursor(cursor, kind)
+    try:
+        observed_at = datetime.fromisoformat(value["observed_at"].replace("Z", "+00:00"))
+        case_id = uuid.UUID(value["id"])
+    except (KeyError, AttributeError, TypeError, ValueError):
+        raise InvalidCursor("Invalid pagination cursor") from None
+    if observed_at.tzinfo is None:
+        raise InvalidCursor("Invalid pagination cursor")
+    return observed_at, case_id
+
+
+def _search_cursor_key(cursor: str) -> tuple[float, str, str]:
+    value = _decode_cursor(cursor, "search")
+    try:
+        score = float(value["score"])
+        observed_at = datetime.fromisoformat(value["observed_at"].replace("Z", "+00:00"))
+        case_id = str(uuid.UUID(value["id"]))
+    except (KeyError, AttributeError, TypeError, ValueError):
+        raise InvalidCursor("Invalid pagination cursor") from None
+    if not math.isfinite(score) or not 0 <= score <= 1 or observed_at.tzinfo is None:
+        raise InvalidCursor("Invalid pagination cursor")
+    return score, _utc(observed_at) or "", case_id
 
 
 def _utc(value: datetime | str | None) -> str | None:
@@ -83,6 +133,22 @@ class PostgresEstimaRepository:
         with self._connect() as conn:
             conn.execute("SELECT 1 FROM atlas_schema_migrations LIMIT 1").fetchone()
         return True
+
+    def stats(self) -> dict[str, int]:
+        with self._connect() as conn:
+            row = conn.execute(
+                self._latest_cte("TRUE") + """
+                SELECT
+                    (SELECT count(*) FROM (
+                        SELECT 1 FROM atlas_cases GROUP BY instance_id, episode_id
+                    ) episodes) AS episodes,
+                    (SELECT count(*) FROM atlas_cases) AS revisions,
+                    (SELECT count(DISTINCT p.pattern_id)
+                     FROM latest_cases c
+                     JOIN atlas_case_patterns p ON p.case_id = c.id) AS patterns
+                """
+            ).fetchone()
+        return {key: int(row[key]) for key in ("episodes", "revisions", "patterns")}
 
     def create_case(self, case: dict[str, Any]) -> dict[str, Any]:
         from psycopg.types.json import Jsonb
@@ -182,7 +248,9 @@ class PostgresEstimaRepository:
         observed_after: datetime | None = None,
         before: datetime | None = None,
         limit: int = 10,
+        cursor: str | None = None,
     ) -> dict[str, Any]:
+        cursor_key = _search_cursor_key(cursor) if cursor else None
         where, params = self._filters(scope, instance_id, observed_after, before)
         terms = list(dict.fromkeys(TOKEN_RE.findall((query or "").casefold())))[:20]
         text_clause = ""
@@ -222,8 +290,62 @@ class PostgresEstimaRepository:
                 "lexical_similarity" if score > 0 else "recent_in_scope"
             )
             scored.append({**record, "score": round(score, 4), "relation": relation})
-        scored.sort(key=lambda item: (item["score"], item["observed_at"] or ""), reverse=True)
-        return {"cases": scored[:limit], "limit": limit, "has_more": len(scored) > limit}
+        scored.sort(key=lambda item: (item["score"], item["observed_at"] or "", item["id"]), reverse=True)
+        if cursor_key is not None:
+            scored = [item for item in scored if (item["score"], item["observed_at"] or "", item["id"]) < cursor_key]
+        page = scored[:limit]
+        has_more = len(scored) > limit
+        next_cursor = None
+        if has_more and page:
+            last = page[-1]
+            next_cursor = _encode_cursor({
+                "kind": "search", "score": last["score"],
+                "observed_at": last["observed_at"], "id": last["id"],
+            })
+        return {"cases": page, "limit": limit, "has_more": has_more, "next_cursor": next_cursor}
+
+    def list_cases(
+        self,
+        *,
+        scope: dict[str, str] | None = None,
+        query: str | None = None,
+        limit: int = 20,
+        cursor: str | None = None,
+    ) -> dict[str, Any]:
+        where, params = self._filters(scope)
+        terms = list(dict.fromkeys(TOKEN_RE.findall((query or "").casefold())))[:20]
+        match_clause = ""
+        if terms:
+            match_clause = " AND c.search_document ILIKE ANY(%s)"
+            params.append([f"%{term}%" for term in terms])
+        cursor_clause = ""
+        if cursor:
+            observed_at, case_id = _cursor_time_id(cursor, "cases")
+            cursor_clause = " AND (c.observed_at, c.id) < (%s, %s)"
+            params.extend((observed_at, case_id))
+        sql = self._latest_cte(where) + f"""
+            SELECT c.* FROM latest_cases c
+            WHERE TRUE{match_clause}{cursor_clause}
+            ORDER BY c.observed_at DESC, c.id DESC
+            LIMIT %s
+        """
+        params.append(limit + 1)
+        with self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        has_more = len(rows) > limit
+        page = rows[:limit]
+        next_cursor = None
+        if has_more and page:
+            last = page[-1]
+            next_cursor = _encode_cursor({
+                "kind": "cases", "observed_at": _utc(last["observed_at"]), "id": str(last["id"]),
+            })
+        return {
+            "cases": [public_case(row) for row in page],
+            "limit": limit,
+            "has_more": has_more,
+            "next_cursor": next_cursor,
+        }
 
     def list_patterns(
         self,

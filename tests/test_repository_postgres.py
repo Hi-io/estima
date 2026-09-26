@@ -9,7 +9,11 @@ from estima.normalize import normalize_case, observation_pattern_id
 from estima.repository import IdempotencyConflict, PostgresEstimaRepository
 
 
-DSN = os.environ.get("ESTIMA_TEST_DATABASE_URL") or os.environ.get("ATLAS_TEST_DATABASE_URL")
+DSN = (
+    os.environ.get("COLLECTIVE_TEST_DATABASE_URL")
+    or os.environ.get("ESTIMA_TEST_DATABASE_URL")
+    or os.environ.get("ATLAS_TEST_DATABASE_URL")
+)
 
 
 def payload(instance: str, episode: str, revision: int, at: datetime, observation: tuple[str, str, int], fingerprint: str | None = None) -> dict:
@@ -27,7 +31,7 @@ def payload(instance: str, episode: str, revision: int, at: datetime, observatio
     }
 
 
-@unittest.skipUnless(DSN, "set ESTIMA_TEST_DATABASE_URL to a disposable PostgreSQL database")
+@unittest.skipUnless(DSN, "set COLLECTIVE_TEST_DATABASE_URL to a disposable PostgreSQL database")
 class PostgresRepositoryTests(unittest.TestCase):
     def setUp(self) -> None:
         self.repo = PostgresEstimaRepository(DSN)
@@ -81,6 +85,48 @@ class PostgresRepositoryTests(unittest.TestCase):
 
         old_pattern_id = observation_pattern_id({"kind": "metric", "key": "restarts", "value": 3, "unit": "count"})
         self.assertIsNone(self.repo.get_pattern(old_pattern_id))
+
+    def test_stats_are_distinct_and_case_pages_follow_latest_revisions(self) -> None:
+        before = self.repo.stats()
+        now = datetime.now(timezone.utc)
+        self.add_case("episode-1", 1, now, ("metric", f"{self.prefix}-old", 1))
+        first = self.add_case("episode-1", 2, now + timedelta(seconds=1), ("metric", f"{self.prefix}-shared", 7))
+        self.add_case("episode-2", 1, now + timedelta(seconds=2), ("metric", f"{self.prefix}-shared", 7))
+        self.add_case("episode-3", 1, now + timedelta(seconds=3), ("metric", f"{self.prefix}-shared", 7))
+
+        after = self.repo.stats()
+        self.assertEqual(after["episodes"] - before["episodes"], 3)
+        self.assertEqual(after["revisions"] - before["revisions"], 4)
+        self.assertEqual(after["patterns"] - before["patterns"], 1)
+
+        page1 = self.repo.list_cases(scope={"cluster": self.cluster}, limit=1)
+        page2 = self.repo.list_cases(scope={"cluster": self.cluster}, limit=1, cursor=page1["next_cursor"])
+        page3 = self.repo.list_cases(scope={"cluster": self.cluster}, limit=1, cursor=page2["next_cursor"])
+        cases = [page["cases"][0] for page in (page1, page2, page3)]
+        self.assertTrue(page1["has_more"])
+        self.assertTrue(page2["has_more"])
+        self.assertFalse(page3["has_more"])
+        self.assertIsNone(page3["next_cursor"])
+        self.assertEqual(len({case["id"] for case in cases}), 3)
+        episode_one = next(case for case in cases if case["episode_id"] == "episode-1")
+        self.assertEqual(episode_one["revision"], 2)
+        self.assertEqual(episode_one["id"], first["id"])
+
+    def test_search_cursor_pages_are_stable_and_complete(self) -> None:
+        now = datetime.now(timezone.utc)
+        self.add_case("search-1", 1, now, ("metric", f"{self.prefix}-one", 1))
+        self.add_case("search-2", 1, now + timedelta(seconds=1), ("metric", f"{self.prefix}-two", 2))
+        self.add_case("search-3", 1, now + timedelta(seconds=2), ("metric", f"{self.prefix}-three", 3))
+
+        page1 = self.repo.search(scope={"cluster": self.cluster}, limit=1)
+        page2 = self.repo.search(scope={"cluster": self.cluster}, limit=1, cursor=page1["next_cursor"])
+        page3 = self.repo.search(scope={"cluster": self.cluster}, limit=1, cursor=page2["next_cursor"])
+
+        cases = [page["cases"][0] for page in (page1, page2, page3)]
+        self.assertTrue(page1["has_more"])
+        self.assertTrue(page2["has_more"])
+        self.assertFalse(page3["has_more"])
+        self.assertEqual(len({case["id"] for case in cases}), 3)
 
     def test_exact_fingerprint_is_ranked_before_newer_lexical_candidates(self) -> None:
         now = datetime.now(timezone.utc)

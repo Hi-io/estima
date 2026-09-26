@@ -67,13 +67,14 @@ class CaseEnvelope(StrictModel):
 class SearchRequest(StrictModel):
     query: str | None = Field(default=None, max_length=500)
     fingerprint: str | None = Field(default=None, max_length=256)
+    cursor: str | None = Field(default=None, min_length=1, max_length=256)
     instance_id: str | None = Field(default=None, max_length=128)
     scope: Scope | None = None
     observed_after: datetime | None = None
     observed_before: datetime | None = None
     # `before` is retained for the FCAPSule producer adapter.
     before: datetime | None = None
-    limit: int = Field(default=10, ge=1, le=10)
+    limit: int = Field(default=10, ge=1, le=50)
 
     @field_validator("observed_after", "observed_before", "before")
     @classmethod

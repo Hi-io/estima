@@ -3,11 +3,11 @@ set -euo pipefail
 
 manifest_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 namespace=fcapsule-atlas
-image_ref=${ESTIMA_IMAGE_REF:-}
+image_ref=${COLLECTIVE_IMAGE_REF:-${ESTIMA_IMAGE_REF:-}}
 
-if [[ ! "$image_ref" =~ ^ghcr\.io/hi-io/estima:sha-[0-9a-f]{40}$ \
-  && ! "$image_ref" =~ ^ghcr\.io/hi-io/estima@sha256:[0-9a-f]{64}$ ]]; then
-  printf '%s\n' "Set ESTIMA_IMAGE_REF to an Estima Git-SHA tag or sha256 digest." >&2
+if [[ ! "$image_ref" =~ ^ghcr\.io/hi-io/(collective|estima):sha-[0-9a-f]{40}$ \
+  && ! "$image_ref" =~ ^ghcr\.io/hi-io/(collective|estima)@sha256:[0-9a-f]{64}$ ]]; then
+  printf '%s\n' "Set COLLECTIVE_IMAGE_REF (or ESTIMA_IMAGE_REF) to a Collective Git-SHA tag or sha256 digest." >&2
   exit 1
 fi
 if grep -q 'storageClassName: replace-with-storage-class' "$manifest_dir/storage.yaml"; then
