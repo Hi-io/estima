@@ -44,6 +44,18 @@ spec:
                   name: atlas-runtime
                   key: COLLECTIVE_API_TOKEN
                   optional: true
+            - name: COLLECTIVE_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: collective-admin-runtime
+                  key: COLLECTIVE_ADMIN_TOKEN
+                  optional: true
+            - name: COLLECTIVE_LEGACY_INSTANCE_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: collective-legacy-binding
+                  key: COLLECTIVE_LEGACY_INSTANCE_ID
+                  optional: true
             - name: ESTIMA_API_TOKEN
               valueFrom:
                 secretKeyRef:

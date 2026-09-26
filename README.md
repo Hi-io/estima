@@ -153,6 +153,12 @@ credential is a trusted control-plane boundary: its holder can provision
 publisher credentials for any instance. Audit rows record key IDs, actions,
 instance, role, and time, never bearer secrets.
 
+Before deploying access control to the existing Kubernetes service, follow
+[`docs/collective-credential-migration.md`](docs/collective-credential-migration.md)
+to verify instance IDs and provision per-instance publisher credentials. The
+deployment manifests keep admin and legacy-instance settings optional; an
+unbound legacy token remains read-only.
+
 ## Shared Deployment
 
 Kubernetes manifests remain in `deploy/kubernetes/estima/` to preserve current

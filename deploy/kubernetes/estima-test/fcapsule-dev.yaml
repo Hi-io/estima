@@ -132,8 +132,9 @@ spec:
             - name: FCAPSULE_ESTIMA_TOKEN
               valueFrom:
                 secretKeyRef:
-                  name: fcapsule-atlas-runtime
-                  key: ATLAS_API_TOKEN
+                  name: fcapsule-estima-publisher-dev-a
+                  key: TOKEN
+                  optional: true
           ports:
             - name: http
               containerPort: 8765
@@ -288,8 +289,9 @@ spec:
             - name: FCAPSULE_ESTIMA_TOKEN
               valueFrom:
                 secretKeyRef:
-                  name: fcapsule-atlas-runtime
-                  key: ATLAS_API_TOKEN
+                  name: fcapsule-estima-publisher-dev-b
+                  key: TOKEN
+                  optional: true
           ports:
             - name: http
               containerPort: 8765
