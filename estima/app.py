@@ -15,7 +15,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope as ASGIScope, Send
 
 from .models import CaseEnvelope, SearchRequest
 from .normalize import UnsafeCase, normalize_case, normalize_fingerprint, normalize_scope_filter
-from .repository import IdempotencyConflict, PostgresEstimaRepository
+from .repository import IdempotencyConflict, InvalidCursor, PostgresEstimaRepository
 
 
 logger = logging.getLogger("estima")
@@ -127,6 +127,8 @@ def create_app(repository: Any | None = None, token: str | None = None) -> FastA
             return method(*args, **kwargs)
         except IdempotencyConflict as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from None
+        except InvalidCursor as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from None
         except HTTPException:
             raise
         except Exception as exc:
@@ -154,6 +156,55 @@ def create_app(repository: Any | None = None, token: str | None = None) -> FastA
         result = call_repository(repo(request).create_case, case)
         return JSONResponse(status_code=201 if result["created"] else 200, content=result)
 
+    @app.get("/v1/stats", dependencies=[Depends(require_token)])
+    def stats(request: Request) -> dict[str, int]:
+        return call_repository(repo(request).stats)
+
+    @app.get("/v1/cases", dependencies=[Depends(require_token)])
+    def list_cases(
+        request: Request,
+        limit: int = Query(default=20, ge=1, le=50),
+        cursor: str | None = Query(default=None, min_length=1, max_length=256),
+        scope: str | None = Query(default=None, max_length=1000),
+        query: str | None = Query(default=None, max_length=500),
+        environment: str | None = Query(default=None, max_length=80),
+        cluster: str | None = Query(default=None, max_length=200),
+        namespace: str | None = Query(default=None, max_length=200),
+        service: str | None = Query(default=None, max_length=200),
+        workload: str | None = Query(default=None, max_length=200),
+        cnfc_id: str | None = Query(default=None, max_length=200),
+        vnfc_id: str | None = Query(default=None, max_length=200),
+    ) -> dict[str, Any]:
+        scope_values: dict[str, Any] = {}
+        if scope:
+            try:
+                parsed_scope = json.loads(scope)
+            except json.JSONDecodeError:
+                raise HTTPException(status_code=422, detail="scope must be a JSON object") from None
+            if not isinstance(parsed_scope, dict):
+                raise HTTPException(status_code=422, detail="scope must be a JSON object")
+            scope_values.update(parsed_scope)
+        for key, value in {
+            "environment": environment, "cluster": cluster, "namespace": namespace,
+            "service": service, "workload": workload, "cnfc_id": cnfc_id, "vnfc_id": vnfc_id,
+        }.items():
+            if value is not None:
+                scope_values[key] = value
+        allowed_scope_keys = {"environment", "cluster", "namespace", "service", "workload", "cnfc_id", "vnfc_id"}
+        if set(scope_values) - allowed_scope_keys or any(not isinstance(value, str) for value in scope_values.values()):
+            raise HTTPException(status_code=422, detail="scope contains an unknown field or non-string value")
+        try:
+            scope_filter = normalize_scope_filter(scope_values)
+        except UnsafeCase as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from None
+        return call_repository(
+            repo(request).list_cases,
+            scope=scope_filter,
+            query=query,
+            limit=limit,
+            cursor=cursor,
+        )
+
     @app.get("/v1/cases/{case_id}", dependencies=[Depends(require_token)])
     def get_case(case_id: str, request: Request) -> dict[str, Any]:
         result = call_repository(repo(request).get_case, case_id)
@@ -179,6 +230,7 @@ def create_app(repository: Any | None = None, token: str | None = None) -> FastA
             observed_after=body.observed_after,
             before=body.observed_before or body.before,
             limit=body.limit,
+            cursor=body.cursor,
         )
 
     @app.get("/v1/patterns", dependencies=[Depends(require_token)])

@@ -21,6 +21,7 @@ class MemoryRepository:
         self.cases: dict[tuple[str, str, int], dict] = {}
         self.search_call: dict | None = None
         self.pattern_call: dict | None = None
+        self.case_list_call: dict | None = None
 
     def migrate(self) -> None:
         pass
@@ -42,9 +43,26 @@ class MemoryRepository:
     def get_case(self, case_id: str) -> dict | None:
         return next((deepcopy(case) for case in self.cases.values() if case["id"] == case_id), None)
 
+    def stats(self) -> dict[str, int]:
+        latest: dict[tuple[str, str], dict] = {}
+        for case in self.cases.values():
+            key = (case["instance_id"], case["episode_id"])
+            if key not in latest or case["revision"] > latest[key]["revision"]:
+                latest[key] = case
+        patterns = {
+            (observation["kind"], observation["key"], json.dumps(observation["value"], sort_keys=True), observation["unit"])
+            for case in latest.values()
+            for observation in case["observations"]
+        }
+        return {"episodes": len(latest), "revisions": len(self.cases), "patterns": len(patterns)}
+
+    def list_cases(self, **kwargs) -> dict:
+        self.case_list_call = kwargs
+        return {"cases": [], "limit": kwargs["limit"], "has_more": False, "next_cursor": None}
+
     def search(self, **kwargs) -> dict:
         self.search_call = kwargs
-        return {"cases": [], "limit": kwargs["limit"], "has_more": False}
+        return {"cases": [], "limit": kwargs["limit"], "has_more": False, "next_cursor": None}
 
     def list_patterns(self, **kwargs) -> dict:
         self.pattern_call = kwargs
@@ -151,6 +169,36 @@ class EstimaAPITests(unittest.TestCase):
         self.assertEqual(detail.status_code, 200)
         self.assertEqual(detail.json()["case"], case)
 
+    def test_stats_count_episodes_revisions_and_distinct_latest_patterns(self) -> None:
+        memory_observation = [{"kind": "metric", "key": "Memory", "value": 7, "unit": "count"}]
+        self.client.post("/v1/cases", json=case_payload(), headers=self.headers)
+        self.client.post("/v1/cases", json=case_payload(revision=2, observations=memory_observation), headers=self.headers)
+        self.client.post("/v1/cases", json=case_payload(episode_id="episode-18", observations=memory_observation), headers=self.headers)
+
+        response = self.client.get("/v1/stats", headers=self.headers)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"episodes": 2, "revisions": 3, "patterns": 1})
+
+    def test_case_listing_passes_scope_query_and_cursor(self) -> None:
+        response = self.client.get(
+            "/v1/cases",
+            params={
+                "scope": json.dumps({"environment": "prod", "cluster": "west-1"}),
+                "query": "restart count", "limit": 25, "cursor": "opaque-cursor",
+            },
+            headers=self.headers,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {
+            "cases": [], "limit": 25, "has_more": False, "next_cursor": None,
+        })
+        self.assertEqual(self.repository.case_list_call["scope"], {"environment": "prod", "cluster": "west-1"})
+        self.assertEqual(self.repository.case_list_call["query"], "restart count")
+        self.assertEqual(self.repository.case_list_call["limit"], 25)
+        self.assertEqual(self.repository.case_list_call["cursor"], "opaque-cursor")
+
     def test_different_payload_under_same_idempotency_key_conflicts(self) -> None:
         self.client.post("/v1/cases", json=case_payload(), headers=self.headers)
         changed = case_payload(summary="Different evidence summary")
@@ -173,7 +221,7 @@ class EstimaAPITests(unittest.TestCase):
         response = self.client.post("/v1/cases", content=b" " * (40 * 1024 + 1), headers=self.headers)
         self.assertEqual(response.status_code, 413)
 
-        response = self.client.post("/v1/search", json={"limit": 11}, headers=self.headers)
+        response = self.client.post("/v1/search", json={"limit": 51}, headers=self.headers)
         self.assertEqual(response.status_code, 422)
 
     def test_search_supports_time_alias_and_exact_scope(self) -> None:
@@ -183,14 +231,16 @@ class EstimaAPITests(unittest.TestCase):
                 "query": "restart count",
                 "scope": {"environment": "prod", "cluster": "west-1"},
                 "before": "2026-08-03T00:00:00Z",
-                "limit": 7,
+                "limit": 50,
+                "cursor": "opaque-cursor",
             },
             headers=self.headers,
         )
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json(), {"cases": [], "limit": 7, "has_more": False})
+        self.assertEqual(response.json(), {"cases": [], "limit": 50, "has_more": False, "next_cursor": None})
         self.assertEqual(self.repository.search_call["scope"], {"environment": "prod", "cluster": "west-1"})
-        self.assertEqual(self.repository.search_call["limit"], 7)
+        self.assertEqual(self.repository.search_call["limit"], 50)
+        self.assertEqual(self.repository.search_call["cursor"], "opaque-cursor")
         self.assertEqual(self.repository.search_call["before"].isoformat(), "2026-08-03T00:00:00+00:00")
 
     def test_search_rejects_naive_time_and_unsafe_scope(self) -> None:
