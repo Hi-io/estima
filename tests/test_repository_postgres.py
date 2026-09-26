@@ -219,19 +219,16 @@ class PostgresRepositoryTests(unittest.TestCase):
             "pool-direct", now - timedelta(minutes=5),
             "Checkout transactions stalled while PostgreSQL connection pool waiters increased sharply",
             [{"kind": "metric", "key": "db_pool_waiters", "value": 42, "unit": "requests"}],
-            fingerprint="fp:checkout-pool-wait",
         )
         healthy = self.add_search_case(
             "pool-healthy", now,
             "Checkout PostgreSQL connection pool is healthy with no waiters and normal latency",
             [{"kind": "metric", "key": "db_pool_waiters", "value": 0, "unit": "requests"}],
-            fingerprint="fp:checkout-pool-wait",
         )
 
         request = {
             "scope": {"cluster": self.cluster},
             "query": "checkout postgres pool wait",
-            "fingerprint": "fp:checkout-pool-wait",
             "limit": 2,
         }
         with patch.dict(os.environ, {"COLLECTIVE_SEARCH_RANKING_ENABLED": "false"}):
