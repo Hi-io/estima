@@ -20,6 +20,13 @@ endpoints. Collective prefers `COLLECTIVE_API_TOKEN` and accepts
 model SDK, model API key, or model call exists in the service. Existing
 FCAPSule instances continue to make all model calls.
 
+The access-control revision keeps unbound legacy tokens read-only. Before
+deploying it to the shared service, follow the
+[credential migration runbook](collective-credential-migration.md) to verify
+each FCAPSule instance ID and provision a separate publisher credential. The
+runbook also covers safe admin-token provisioning and the optional, temporary
+single-instance legacy binding.
+
 ## Rollout
 
 1. Confirm the PVC is Bound and take a database backup using the cluster's
