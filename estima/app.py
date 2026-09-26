@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hmac
+import asyncio
 import json
 import logging
 import os
@@ -11,12 +12,12 @@ from typing import Any, Callable
 
 from fastapi import Depends, FastAPI, HTTPException, Path, Query, Request, status
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from starlette.types import ASGIApp, Message, Receive, Scope as ASGIScope, Send
 
 from .models import CaseEnvelope, SearchRequest
-from .normalize import UnsafeCase, normalize_case, normalize_fingerprint, normalize_instance_id, normalize_scope_filter
-from .repository import CredentialUnavailable, IdempotencyConflict, InvalidCursor, PostgresEstimaRepository
+from .normalize import UnsafeCase, normalize_case, normalize_episode_id, normalize_fingerprint, normalize_instance_id, normalize_scope_filter
+from .repository import CredentialUnavailable, EpisodeUnavailable, IdempotencyConflict, InvalidCursor, MAX_RETENTION_DAYS, PostgresEstimaRepository
 
 
 logger = logging.getLogger("estima")
@@ -24,6 +25,8 @@ MAX_BODY_BYTES = 40 * 1024
 MIN_TOKEN_BYTES = 24
 DEFAULT_CREDENTIAL_OVERLAP_SECONDS = 300
 MAX_CREDENTIAL_OVERLAP_SECONDS = 3600
+RETENTION_SWEEP_SECONDS = 24 * 60 * 60
+RETENTION_RETRY_SECONDS = 5 * 60
 
 
 @dataclass(frozen=True)
@@ -89,11 +92,27 @@ def create_app(
     admin_token: str | None = None,
     legacy_instance_id: str | None = None,
     credential_overlap_seconds: int | None = None,
+    retention_days: int | None = None,
 ) -> FastAPI:
     configured_token = token
     configured_admin_token = admin_token
     configured_legacy_instance_id = legacy_instance_id
     configured_overlap_seconds = credential_overlap_seconds
+    configured_retention_days = retention_days
+
+    async def retention_worker(app: FastAPI, days: int) -> None:
+        delay = RETENTION_SWEEP_SECONDS
+        while True:
+            await asyncio.sleep(delay)
+            try:
+                await asyncio.to_thread(app.state.repository.purge_expired_cases, retention_days=days)
+            except Exception as exc:
+                app.state.retention_ready = False
+                logger.error("Collective retention sweep failed (%s)", type(exc).__name__)
+                delay = RETENTION_RETRY_SECONDS
+            else:
+                app.state.retention_ready = True
+                delay = RETENTION_SWEEP_SECONDS
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -128,19 +147,46 @@ def create_app(
                 raise RuntimeError("COLLECTIVE_CREDENTIAL_OVERLAP_SECONDS must be an integer") from None
         if not 0 <= overlap_seconds <= MAX_CREDENTIAL_OVERLAP_SECONDS:
             raise RuntimeError("COLLECTIVE_CREDENTIAL_OVERLAP_SECONDS must be between 0 and 3600")
+        actual_retention_days = configured_retention_days
+        if actual_retention_days is None:
+            raw_retention_days = os.environ.get("COLLECTIVE_RETENTION_DAYS")
+            try:
+                actual_retention_days = int(raw_retention_days) if raw_retention_days is not None else None
+            except ValueError:
+                raise RuntimeError("COLLECTIVE_RETENTION_DAYS must be an integer") from None
+        if actual_retention_days is not None and not 1 <= actual_retention_days <= MAX_RETENTION_DAYS:
+            raise RuntimeError(f"COLLECTIVE_RETENTION_DAYS must be between 1 and {MAX_RETENTION_DAYS}")
         app.state.token = actual_token
         app.state.admin_token = actual_admin_token
         app.state.legacy_instance_id = instance_id
         app.state.credential_overlap_seconds = overlap_seconds
+        app.state.retention_days = actual_retention_days
         app.state.repository = repository
         if app.state.repository is None:
             app.state.repository = PostgresEstimaRepository()
         app.state.repository.migrate()
+        app.state.retention_ready = True
+        if actual_retention_days is not None:
+            await asyncio.to_thread(
+                app.state.repository.purge_expired_cases,
+                retention_days=actual_retention_days,
+            )
         app.state.ready = True
+        retention_task = (
+            asyncio.create_task(retention_worker(app, actual_retention_days))
+            if actual_retention_days is not None
+            else None
+        )
         try:
             yield
         finally:
             app.state.ready = False
+            if retention_task is not None:
+                retention_task.cancel()
+                try:
+                    await retention_task
+                except asyncio.CancelledError:
+                    pass
 
     app = FastAPI(title="Collective", version="1.0.0", lifespan=lifespan)
     app.add_middleware(MaxBodySizeMiddleware)
@@ -203,7 +249,11 @@ def create_app(
 
     def repo(request: Request) -> Any:
         instance = getattr(request.app.state, "repository", None)
-        if not getattr(request.app.state, "ready", False) or instance is None:
+        if (
+            not getattr(request.app.state, "ready", False)
+            or not getattr(request.app.state, "retention_ready", True)
+            or instance is None
+        ):
             raise HTTPException(status_code=503, detail="Collective data service is not ready")
         return instance
 
@@ -216,6 +266,8 @@ def create_app(
             raise HTTPException(status_code=422, detail=str(exc)) from None
         except CredentialUnavailable as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from None
+        except EpisodeUnavailable as exc:
+            raise HTTPException(status_code=410, detail=str(exc)) from None
         except HTTPException:
             raise
         except Exception as exc:
@@ -225,7 +277,11 @@ def create_app(
     @app.get("/healthz", include_in_schema=False)
     def healthz(request: Request) -> JSONResponse:
         instance = getattr(request.app.state, "repository", None)
-        if not getattr(request.app.state, "ready", False) or instance is None:
+        if (
+            not getattr(request.app.state, "ready", False)
+            or not getattr(request.app.state, "retention_ready", True)
+            or instance is None
+        ):
             return JSONResponse(status_code=503, content={"status": "unavailable"})
         try:
             instance.healthcheck()
@@ -248,6 +304,24 @@ def create_app(
             raise HTTPException(status_code=403, detail="Case instance_id does not match the publisher credential")
         result = call_repository(repo(request).create_case, case)
         return JSONResponse(status_code=201 if result["created"] else 200, content=result)
+
+    @app.delete("/v1/episodes/{episode_id}", status_code=204)
+    def withdraw_episode(
+        request: Request,
+        episode_id: str = Path(min_length=1, max_length=128),
+        principal: Principal = Depends(require_publisher),
+    ) -> Response:
+        try:
+            normalized_episode_id = normalize_episode_id(episode_id)
+        except UnsafeCase as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from None
+        call_repository(
+            repo(request).withdraw_episode,
+            instance_id=principal.instance_id,
+            episode_id=normalized_episode_id,
+            actor_key_id=principal.key_id,
+        )
+        return Response(status_code=204)
 
     @app.get("/v1/stats", dependencies=[Depends(require_reader)])
     def stats(request: Request) -> dict[str, int]:

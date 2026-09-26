@@ -21,6 +21,9 @@ MAX_SEARCH_CANDIDATES = 500
 MAX_PATTERN_MEMBERS = 10
 SCOPE_KEYS = ("environment", "cluster", "namespace", "service", "workload", "cnfc_id", "vnfc_id")
 TOKEN_RE = re.compile(r"[a-z0-9_]+")
+LIFECYCLE_WRITE_LOCK = 620018272
+EPISODE_LOCK_SEED = 620018273
+MAX_RETENTION_DAYS = 3650
 
 
 class IdempotencyConflict(ValueError):
@@ -32,6 +35,10 @@ class InvalidCursor(ValueError):
 
 
 class CredentialUnavailable(ValueError):
+    pass
+
+
+class EpisodeUnavailable(ValueError):
     pass
 
 
@@ -114,6 +121,15 @@ class PostgresEstimaRepository:
         from psycopg.rows import dict_row
 
         return psycopg.connect(self.dsn, connect_timeout=3, row_factory=dict_row)
+
+    @staticmethod
+    def _lock_lifecycle_write(conn: Any, instance_id: str, episode_id: str) -> None:
+        conn.execute("SELECT pg_advisory_xact_lock_shared(%s)", (LIFECYCLE_WRITE_LOCK,))
+        lock_key = json.dumps([instance_id, episode_id], ensure_ascii=False, separators=(",", ":"))
+        conn.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended(%s, %s))",
+            (lock_key, EPISODE_LOCK_SEED),
+        )
 
     def migrate(self) -> None:
         with self._connect() as conn:
@@ -296,6 +312,14 @@ class PostgresEstimaRepository:
             document,
         )
         with self._connect() as conn:
+            self._lock_lifecycle_write(conn, case["instance_id"], case["episode_id"])
+            withdrawn = conn.execute(
+                """SELECT 1 FROM atlas_episode_tombstones
+                   WHERE instance_id = %s AND episode_id = %s""",
+                (case["instance_id"], case["episode_id"]),
+            ).fetchone()
+            if withdrawn is not None:
+                raise EpisodeUnavailable("This episode is no longer available")
             inserted = conn.execute(
                 """INSERT INTO atlas_cases
                    (id, schema_version, normalization_version, instance_id, episode_id, revision, observed_at,
@@ -329,6 +353,73 @@ class PostgresEstimaRepository:
             if any(existing_case[key] != value for key, value in case.items()):
                 raise IdempotencyConflict("This idempotency key already has a different case payload")
             return {"case": existing_case, "created": False}
+
+    def withdraw_episode(self, *, instance_id: str, episode_id: str, actor_key_id: str) -> int:
+        with self._connect() as conn:
+            self._lock_lifecycle_write(conn, instance_id, episode_id)
+            tombstone = conn.execute(
+                """INSERT INTO atlas_episode_tombstones
+                   (instance_id, episode_id, reason, actor_key_id)
+                   VALUES (%s, %s, 'publisher', %s)
+                   ON CONFLICT (instance_id, episode_id) DO NOTHING
+                   RETURNING instance_id""",
+                (instance_id, episode_id, actor_key_id),
+            ).fetchone()
+            deleted = conn.execute(
+                "DELETE FROM atlas_cases WHERE instance_id = %s AND episode_id = %s",
+                (instance_id, episode_id),
+            ).rowcount
+            if tombstone is not None:
+                conn.execute(
+                    """INSERT INTO atlas_case_lifecycle_audit
+                       (actor_key_id, action, instance_id, episode_id, deleted_case_count)
+                       VALUES (%s, 'episode_withdrawn', %s, %s, %s)""",
+                    (actor_key_id, instance_id, episode_id, deleted),
+                )
+        return int(deleted)
+
+    def purge_expired_cases(self, *, retention_days: int) -> int:
+        if not 1 <= retention_days <= MAX_RETENTION_DAYS:
+            raise ValueError(f"retention_days must be between 1 and {MAX_RETENTION_DAYS}")
+        deleted_total = 0
+        with self._connect() as conn:
+            conn.execute("SELECT pg_advisory_xact_lock(%s)", (LIFECYCLE_WRITE_LOCK,))
+            while True:
+                episodes = conn.execute(
+                    """SELECT instance_id, episode_id
+                       FROM atlas_cases
+                       GROUP BY instance_id, episode_id
+                       HAVING max(created_at) <= clock_timestamp() - (%s * interval '1 day')
+                       ORDER BY instance_id, episode_id
+                       LIMIT 500""",
+                    (retention_days,),
+                ).fetchall()
+                if not episodes:
+                    break
+                for episode in episodes:
+                    instance_id = episode["instance_id"]
+                    episode_id = episode["episode_id"]
+                    tombstone = conn.execute(
+                        """INSERT INTO atlas_episode_tombstones
+                           (instance_id, episode_id, reason, actor_key_id)
+                           VALUES (%s, %s, 'retention', 'system-retention')
+                           ON CONFLICT (instance_id, episode_id) DO NOTHING
+                           RETURNING instance_id""",
+                        (instance_id, episode_id),
+                    ).fetchone()
+                    deleted = conn.execute(
+                        "DELETE FROM atlas_cases WHERE instance_id = %s AND episode_id = %s",
+                        (instance_id, episode_id),
+                    ).rowcount
+                    deleted_total += int(deleted)
+                    if deleted and tombstone is not None:
+                        conn.execute(
+                            """INSERT INTO atlas_case_lifecycle_audit
+                               (actor_key_id, action, instance_id, episode_id, deleted_case_count, retention_days)
+                               VALUES ('system-retention', 'episode_retention_expired', %s, %s, %s, %s)""",
+                            (instance_id, episode_id, deleted, retention_days),
+                        )
+        return deleted_total
 
     @staticmethod
     def _filters(

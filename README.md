@@ -51,7 +51,8 @@ described under [Credential Migration And Trust Boundary](#credential-migration-
   `episode_id`, `revision`, timezone-aware `observed_at`, `scope`, `summary`,
   `observations`, and `hypotheses`. Replaying the same
   `(instance_id, episode_id, revision)` payload returns the same case; a
-  different payload for that key returns `409`.
+  different payload for that key returns `409`. Publishing an episode after
+  its withdrawal or retention expiry returns `410` and cannot restore it.
 - `GET /v1/stats` returns exact distinct totals: `episodes` counts distinct
   `(instance_id, episode_id)` pairs, `revisions` counts stored case revisions,
   and `patterns` counts distinct patterns represented by the latest revision
@@ -61,6 +62,11 @@ described under [Credential Migration And Trust Boundary](#credential-migration-
   and `query`. Its response contains `cases`, `limit`, `has_more`, and
   `next_cursor`; pass the cursor with the same filters to get the next page.
 - `GET /v1/cases/{id}` returns a stored case.
+- `DELETE /v1/episodes/{episode_id}` withdraws every shared revision for the
+  authenticated publisher's bound instance. It always returns `204`, including
+  on repeat requests, and never accepts an instance ID from the caller. The
+  local FCAPSule incident and its artifacts are separate; this endpoint only
+  withdraws Collective's shared copy.
 - `POST /v1/search` retrieves latest revisions by scope, time, text, or exact
   fingerprint. Ranking scores are heuristics, not probabilities. Search accepts
   `limit` up to 50 and an optional `cursor`; its response adds `next_cursor` to
@@ -89,6 +95,27 @@ Bodies are limited to 40 KiB; observations must be scalar, and bounds reject
 secret-looking fields/values and nested raw telemetry. These checks are
 defense in depth, not a substitute for upstream data minimization, TLS,
 backups, and secret management.
+
+## Withdrawal And Retention
+
+Withdrawal removes all case revisions and their pattern rows in one
+transaction. A minimal `(instance_id, episode_id)` tombstone remains so delayed
+publisher retries cannot resurrect withdrawn knowledge; the tombstone is
+permanent and there is no re-open operation. Non-secret lifecycle audit rows
+record the actor key ID, action, episode identity, deleted revision count, and
+time. Retention expiry uses the same deletion and tombstone behavior, with a
+system actor. Neither tombstones nor audit rows contain case payloads or bearer
+secrets.
+
+Retention is opt-in: if `COLLECTIVE_RETENTION_DAYS` is unset, shared cases are
+kept until explicitly withdrawn. Set it to an integer from 1 through 3650 to
+expire an episode after that many days without a new revision. The clock uses
+service-side record creation time, not producer-controlled `observed_at`; a
+new revision refreshes the episode's retention age. The service sweeps at
+startup and every 24 hours. An unsuccessful sweep makes data routes unavailable
+until a retry succeeds, rather than serving records known to be past retention.
+Because expiry leaves a permanent tombstone, producers must use a new episode
+ID for genuinely new work after an episode has expired.
 
 ## Credential Migration And Trust Boundary
 

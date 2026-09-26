@@ -41,6 +41,10 @@ def normalize_instance_id(value: str) -> str:
     return _safe_text(value, "instance_id", 128)
 
 
+def normalize_episode_id(value: str) -> str:
+    return _safe_text(value, "episode_id", 128)
+
+
 def normalize_key(value: str, *, field: str = "key") -> str:
     text = unicodedata.normalize("NFKC", value).strip().casefold()
     normalized = KEY_CHARS.sub("_", text).strip("_")
@@ -80,7 +84,7 @@ def normalize_case(payload: CaseEnvelope | dict[str, Any]) -> dict[str, Any]:
         raise
 
     instance_id = normalize_instance_id(envelope.instance_id)
-    episode_id = _safe_text(envelope.episode_id, "episode_id", 128)
+    episode_id = normalize_episode_id(envelope.episode_id)
     scope: dict[str, str | None] = {}
     for key, value in envelope.scope.model_dump().items():
         scope[key] = None if value is None else _safe_text(value, f"scope.{key}", 200)
