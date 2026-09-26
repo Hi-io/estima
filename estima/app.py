@@ -77,9 +77,14 @@ def create_app(repository: Any | None = None, token: str | None = None) -> FastA
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        actual_token = configured_token or os.environ.get("ESTIMA_API_TOKEN") or os.environ.get("ATLAS_API_TOKEN")
+        actual_token = (
+            configured_token
+            or os.environ.get("COLLECTIVE_API_TOKEN")
+            or os.environ.get("ESTIMA_API_TOKEN")
+            or os.environ.get("ATLAS_API_TOKEN")
+        )
         if actual_token is None or len(actual_token.encode("utf-8")) < MIN_TOKEN_BYTES:
-            raise RuntimeError("ESTIMA_API_TOKEN must contain at least 24 bytes")
+            raise RuntimeError("COLLECTIVE_API_TOKEN must contain at least 24 bytes")
         app.state.token = actual_token
         app.state.repository = repository
         if app.state.repository is None:
@@ -91,7 +96,7 @@ def create_app(repository: Any | None = None, token: str | None = None) -> FastA
         finally:
             app.state.ready = False
 
-    app = FastAPI(title="Estima", version="1.0.0", lifespan=lifespan)
+    app = FastAPI(title="Collective", version="1.0.0", lifespan=lifespan)
     app.add_middleware(MaxBodySizeMiddleware)
 
     @app.exception_handler(RequestValidationError)
@@ -103,7 +108,7 @@ def create_app(repository: Any | None = None, token: str | None = None) -> FastA
     def require_token(request: Request) -> None:
         expected = getattr(request.app.state, "token", None)
         if not expected:
-            raise HTTPException(status_code=503, detail="Estima is not configured")
+            raise HTTPException(status_code=503, detail="Collective is not configured")
         authorization = request.headers.get("authorization", "")
         scheme, _, supplied = authorization.partition(" ")
         valid = scheme.casefold() == "bearer" and bool(supplied)
@@ -119,7 +124,7 @@ def create_app(repository: Any | None = None, token: str | None = None) -> FastA
     def repo(request: Request) -> Any:
         instance = getattr(request.app.state, "repository", None)
         if not getattr(request.app.state, "ready", False) or instance is None:
-            raise HTTPException(status_code=503, detail="Estima data service is not ready")
+            raise HTTPException(status_code=503, detail="Collective data service is not ready")
         return instance
 
     def call_repository(method: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
@@ -132,8 +137,8 @@ def create_app(repository: Any | None = None, token: str | None = None) -> FastA
         except HTTPException:
             raise
         except Exception as exc:
-            logger.error("Estima repository request failed (%s)", type(exc).__name__)
-            raise HTTPException(status_code=503, detail="Estima data service is unavailable") from None
+            logger.error("Collective repository request failed (%s)", type(exc).__name__)
+            raise HTTPException(status_code=503, detail="Collective data service is unavailable") from None
 
     @app.get("/healthz", include_in_schema=False)
     def healthz(request: Request) -> JSONResponse:
@@ -143,7 +148,7 @@ def create_app(repository: Any | None = None, token: str | None = None) -> FastA
         try:
             instance.healthcheck()
         except Exception as exc:
-            logger.error("Estima healthcheck failed (%s)", type(exc).__name__)
+            logger.error("Collective healthcheck failed (%s)", type(exc).__name__)
             return JSONResponse(status_code=503, content={"status": "unavailable"})
         return JSONResponse(content={"status": "ok"})
 

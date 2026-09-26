@@ -1,41 +1,43 @@
-# Estima
+# Collective
 
-**FCAPSule investigates; Estima remembers.** Estima is a shared, durable
-memory API for curated operational cases prepared by FCAPSule instances. It
-stores and retrieves background without deciding what that background means.
+**FCAPSule investigates; Collective remembers.** Collective is a shared,
+durable memory API for curated operational cases prepared by FCAPSule
+instances. It stores and retrieves background without deciding what that
+background means. Collective was previously named Estima; its Python module,
+`/v1` API, database schema, and existing deployment names remain compatible.
 
 Each FCAPSule instance runs its own models, analyzes evidence, decides what to
-share, and interprets retrieved history. Estima stores observations separately
-from hypotheses and returns both in their original categories. It does not
+share, and interprets retrieved history. Collective stores observations
+separately from hypotheses and returns both in their original categories. It does not
 execute LLMs, call model providers, require model API keys, or incur model-token
-usage. Multiple FCAPSule instances may use one Estima; the integration is
+usage. Multiple FCAPSule instances may use one Collective; the integration is
 optional, so FCAPSule continues to work without it.
 
 ## Run Locally
 
-Estima requires PostgreSQL 14 or newer and Python 3.11 or newer.
+Collective requires PostgreSQL 14 or newer and Python 3.11 or newer.
 
 ```sh
 export DATABASE_URL='postgresql://estima:password@localhost:5432/estima'
-export ESTIMA_API_TOKEN="$(openssl rand -hex 32)"
+export COLLECTIVE_API_TOKEN="$(openssl rand -hex 32)"
 python -m pip install -e .
 python -m uvicorn estima.app:app --host 0.0.0.0 --port 8080
 ```
 
-At startup Estima applies versioned SQL migrations and becomes ready only
+The `estima` Python module path is retained for existing launch commands. At
+startup Collective applies versioned SQL migrations and becomes ready only
 after PostgreSQL is reachable. `/healthz` is unauthenticated; all data routes
-require `Authorization: Bearer $ESTIMA_API_TOKEN`. `DATABASE_URL` is the
-database connection setting. For existing Atlas installs, `ATLAS_API_TOKEN`
-is temporarily accepted as a fallback; prefer `ESTIMA_API_TOKEN` for new
-deployments.
+require `Authorization: Bearer $COLLECTIVE_API_TOKEN`. `DATABASE_URL` is the
+database connection setting. `ESTIMA_API_TOKEN` and `ATLAS_API_TOKEN` remain
+accepted as fallbacks for existing deployments.
 
 Run the container locally:
 
 ```sh
-docker build -t estima-service:local .
+docker build -t collective-service:local .
 docker run --rm -p 8080:8080 \
   -e DATABASE_URL='postgresql://estima:password@host.docker.internal:5432/estima' \
-  -e ESTIMA_API_TOKEN="$ESTIMA_API_TOKEN" estima-service:local
+  -e COLLECTIVE_API_TOKEN="$COLLECTIVE_API_TOKEN" collective-service:local
 ```
 
 ## API
@@ -48,15 +50,26 @@ FCAPSule client:
   `observations`, and `hypotheses`. Replaying the same
   `(instance_id, episode_id, revision)` payload returns the same case; a
   different payload for that key returns `409`.
+- `GET /v1/stats` returns exact distinct totals: `episodes` counts distinct
+  `(instance_id, episode_id)` pairs, `revisions` counts stored case revisions,
+  and `patterns` counts distinct patterns represented by the latest revision
+  of each episode.
+- `GET /v1/cases` lists the latest revision for each episode. It accepts
+  `limit` (default 20, maximum 50), an opaque `cursor`, optional `scope` JSON,
+  and `query`. Its response contains `cases`, `limit`, `has_more`, and
+  `next_cursor`; pass the cursor with the same filters to get the next page.
 - `GET /v1/cases/{id}` returns a stored case.
 - `POST /v1/search` retrieves latest revisions by scope, time, text, or exact
-  fingerprint. Ranking scores are heuristics, not probabilities.
+  fingerprint. Ranking scores are heuristics, not probabilities. Search accepts
+  `limit` up to 50 and an optional `cursor`; its response adds `next_cursor` to
+  the existing `cases`, `limit`, and `has_more` fields. Candidate evaluation
+  remains bounded to 500 records.
 - `GET /v1/patterns` returns repeated typed observations; `GET
   /v1/patterns/{id}` returns the aggregate and member cases. Co-occurrence is
   not reported as a shared cause.
 
 Observation facts and unverified hypotheses use separate fields and remain
-separate in storage and responses. Estima does not infer causes, resolutions,
+separate in storage and responses. Collective does not infer causes, resolutions,
 or interpretations. Scope includes environment, cluster, namespace, service,
 workload, CNFC ID, and VNFC ID.
 
@@ -64,24 +77,35 @@ Bodies are limited to 40 KiB; observations must be scalar, and bounds reject
 secret-looking fields/values and nested raw telemetry. These checks are
 defense in depth, not a substitute for upstream data minimization, TLS,
 authorization, backups, and secret management. Authentication uses a shared
-service token; it is not per-instance authorization.
+service token and assumes a trusted, single-organization deployment. It is not
+per-instance authorization, so callers can claim any `instance_id`.
 
 ## Shared Deployment
 
-Kubernetes manifests live in `deploy/kubernetes/estima/`. The API image is
-built from this repository's Dockerfile and published to
+Kubernetes manifests remain in `deploy/kubernetes/estima/` to preserve current
+deployment paths and DNS. The API image is built from this repository's
+Dockerfile and published as both `ghcr.io/hi-io/collective` and the compatible
 `ghcr.io/hi-io/estima` by `.github/workflows/publish-image.yml` on `main` and
-version tags. Deploy a pinned image tag or digest with:
+version tags. The workflow also supports a manual publish for a full commit
+SHA, and requires the latest `Tests` run for that SHA to pass. GitHub exposes
+manual dispatch after the workflow revision is present on the default branch.
+Deploy a pinned image tag or digest with:
 
 ```sh
-ESTIMA_IMAGE_REF="ghcr.io/hi-io/estima:sha-$(git rev-parse HEAD)" \
+COLLECTIVE_IMAGE_REF="ghcr.io/hi-io/collective:sha-$(git rev-parse HEAD)" \
   deploy/kubernetes/estima/apply.sh
 ```
 
+`ESTIMA_IMAGE_REF` and `ghcr.io/hi-io/estima` images remain accepted during
+the transition. Deployment and Service names (`estima`, `atlas`), the
+namespace, database, PVC, tables, and FCAPSule `FCAPSULE_ESTIMA_*` settings
+remain compatible.
+
 The long-lived compatibility profile keeps the current `fcapsule-atlas`
 namespace and checks for the existing Atlas database objects. It deploys
-Estima alongside the Atlas API, waits for Estima readiness, then adds the new
-`estima` Service and repoints legacy `atlas` DNS to Estima. It never applies
+Collective alongside the Atlas API, waits for Collective readiness, then
+applies the existing `estima` Service and repoints legacy `atlas` DNS to
+Collective. It never applies
 the database or PVC manifests during that migration. See
 [`docs/migration-from-atlas.md`](docs/migration-from-atlas.md) before applying
 it.
@@ -94,12 +118,13 @@ for a new installation with `deploy/kubernetes/estima/install-fresh.sh`.
 Create the `estima-postgres` Secret and `atlas-runtime` Secret through the
 approved secret manager first. The runtime Secret's `DATABASE_URL` must point
 to `estima-postgres` and use database/user `estima`; its
-`ATLAS_API_TOKEN` key is a temporary compatibility detail. Never apply the
+`COLLECTIVE_API_TOKEN` key may be used for new installs; `ESTIMA_API_TOKEN` and
+`ATLAS_API_TOKEN` remain compatibility fallbacks. Never apply the
 fresh database files over an existing database as a way to rename it.
 
 `deploy/kubernetes/estima-test/` provides an isolated A/B integration profile
 for the synthetic `fcapsule-atlas-test` database and PVC. Its test cases must
-not be mixed into the shared Estima database.
+not be mixed into the shared Collective database.
 
 ## Development
 
@@ -107,10 +132,11 @@ Install the project and run all unit and PostgreSQL integration tests:
 
 ```sh
 python -m pip install -e '.[test]'
-ESTIMA_TEST_DATABASE_URL='postgresql://estima:password@localhost:5432/estima_test' \
+COLLECTIVE_TEST_DATABASE_URL='postgresql://estima:password@localhost:5432/estima_test' \
   python -m unittest discover -s tests -v
 ```
 
-Without `ESTIMA_TEST_DATABASE_URL`, PostgreSQL-specific tests are skipped; CI
-starts PostgreSQL and runs them. The integration test database must be
+`ESTIMA_TEST_DATABASE_URL` and `ATLAS_TEST_DATABASE_URL` remain accepted as
+legacy test settings. Without a database URL, PostgreSQL-specific tests are
+skipped; CI starts PostgreSQL and runs them. The integration test database must be
 disposable because its migration creates the compatibility tables.

@@ -8,7 +8,7 @@ WORKDIR /srv
 COPY pyproject.toml /srv/pyproject.toml
 COPY estima /srv/estima
 RUN pip install --no-cache-dir . \
-    && useradd --system --uid 10001 --create-home estima
+    && useradd --system --uid 10001 --create-home collective
 
 USER 10001:10001
 EXPOSE 8080

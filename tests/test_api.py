@@ -10,10 +10,36 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from estima.app import create_app
-from estima.repository import IdempotencyConflict
+from estima.repository import InvalidCursor, IdempotencyConflict, _cursor_time_id, _encode_cursor, _search_cursor_key
 
 
-TOKEN = "estima-test-token-with-at-least-32-bytes"
+TOKEN = "collective-test-token-with-at-least-32-bytes"
+
+
+class CursorTests(unittest.TestCase):
+    def test_case_and_search_cursors_are_typed_and_timezone_aware(self) -> None:
+        case_id = str(uuid.uuid4())
+        search_cursor = _encode_cursor({
+            "kind": "search", "score": 0.75,
+            "observed_at": "2026-08-02T09:15:00+09:00", "id": case_id,
+        })
+        case_cursor = _encode_cursor({
+            "kind": "cases", "observed_at": "2026-08-02T09:15:00+09:00", "id": case_id,
+        })
+
+        self.assertEqual(
+            _search_cursor_key(search_cursor),
+            (0.75, "2026-08-02T00:15:00Z", case_id),
+        )
+        observed_at, parsed_id = _cursor_time_id(case_cursor, "cases")
+        self.assertEqual(observed_at.isoformat(), "2026-08-02T09:15:00+09:00")
+        self.assertEqual(str(parsed_id), case_id)
+
+    def test_invalid_pagination_cursors_are_rejected(self) -> None:
+        with self.assertRaises(InvalidCursor):
+            _search_cursor_key("not-a-cursor")
+        with self.assertRaises(InvalidCursor):
+            _cursor_time_id(_encode_cursor({"kind": "search"}), "cases")
 
 
 class MemoryRepository:
@@ -111,7 +137,7 @@ def case_payload(**changes) -> dict:
     return payload
 
 
-class EstimaAPITests(unittest.TestCase):
+class CollectiveAPITests(unittest.TestCase):
     def setUp(self) -> None:
         self.repository = MemoryRepository()
         self.context = TestClient(create_app(repository=self.repository, token=TOKEN))
@@ -125,16 +151,18 @@ class EstimaAPITests(unittest.TestCase):
         response = self.client.get("/healthz")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"status": "ok"})
+        self.assertEqual(self.client.get("/openapi.json").json()["info"]["title"], "Collective")
 
     def test_data_endpoints_require_bearer_token(self) -> None:
         response = self.client.post("/v1/search", json={})
         self.assertEqual(response.status_code, 401)
         self.assertEqual(response.headers["www-authenticate"], "Bearer")
 
-    def test_estima_token_is_preferred_and_atlas_token_remains_compatible(self) -> None:
-        old_token = "old-atlas-token-value-long-enough"
+    def test_collective_token_is_preferred_and_legacy_tokens_remain_compatible(self) -> None:
+        old_token = "old-estima-token-value-long-enough"
         for values in (
-            {"ESTIMA_API_TOKEN": TOKEN, "ATLAS_API_TOKEN": old_token},
+            {"COLLECTIVE_API_TOKEN": TOKEN, "ESTIMA_API_TOKEN": old_token, "ATLAS_API_TOKEN": old_token},
+            {"ESTIMA_API_TOKEN": TOKEN},
             {"ATLAS_API_TOKEN": TOKEN},
         ):
             with patch.dict(os.environ, values, clear=True):

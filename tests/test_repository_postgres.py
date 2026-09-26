@@ -9,7 +9,11 @@ from estima.normalize import normalize_case, observation_pattern_id
 from estima.repository import IdempotencyConflict, PostgresEstimaRepository
 
 
-DSN = os.environ.get("ESTIMA_TEST_DATABASE_URL") or os.environ.get("ATLAS_TEST_DATABASE_URL")
+DSN = (
+    os.environ.get("COLLECTIVE_TEST_DATABASE_URL")
+    or os.environ.get("ESTIMA_TEST_DATABASE_URL")
+    or os.environ.get("ATLAS_TEST_DATABASE_URL")
+)
 
 
 def payload(instance: str, episode: str, revision: int, at: datetime, observation: tuple[str, str, int], fingerprint: str | None = None) -> dict:
@@ -27,7 +31,7 @@ def payload(instance: str, episode: str, revision: int, at: datetime, observatio
     }
 
 
-@unittest.skipUnless(DSN, "set ESTIMA_TEST_DATABASE_URL to a disposable PostgreSQL database")
+@unittest.skipUnless(DSN, "set COLLECTIVE_TEST_DATABASE_URL to a disposable PostgreSQL database")
 class PostgresRepositoryTests(unittest.TestCase):
     def setUp(self) -> None:
         self.repo = PostgresEstimaRepository(DSN)
