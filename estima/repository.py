@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from .normalize import observation_pattern_id, search_document
+from .ranking import rank_search_candidates
 
 
 MIGRATIONS = Path(__file__).with_name("migrations")
@@ -24,6 +25,11 @@ TOKEN_RE = re.compile(r"[a-z0-9_]+")
 LIFECYCLE_WRITE_LOCK = 620018272
 EPISODE_LOCK_SEED = 620018273
 MAX_RETENTION_DAYS = 3650
+SEARCH_RANKING_FLAG = "COLLECTIVE_SEARCH_RANKING_ENABLED"
+
+
+def _search_ranking_enabled() -> bool:
+    return os.environ.get(SEARCH_RANKING_FLAG, "").strip().casefold() in {"1", "true", "yes", "on"}
 
 
 class IdempotencyConflict(ValueError):
@@ -493,19 +499,26 @@ class PostgresEstimaRepository:
         with self._connect() as conn:
             rows = conn.execute(sql, params).fetchall()
 
-        scored = []
-        for row in rows:
-            record = public_case(row)
-            text = row["search_document"].casefold()
-            exact_fingerprint = bool(fingerprint and row["fingerprint"] == fingerprint)
-            matched = sum(1 for term in terms if term in text)
-            coverage = matched / len(terms) if terms else 0.0
-            phrase_bonus = 0.25 if query and " ".join(query.casefold().split()) in text else 0.0
-            score = 1.0 if exact_fingerprint else min(1.0, coverage * 0.75 + phrase_bonus)
-            relation = "fingerprint_match" if exact_fingerprint else (
-                "lexical_similarity" if score > 0 else "recent_in_scope"
+        if _search_ranking_enabled():
+            scored = rank_search_candidates(
+                [public_case(row) for row in rows],
+                query=query,
+                fingerprint=fingerprint,
             )
-            scored.append({**record, "score": round(score, 4), "relation": relation})
+        else:
+            scored = []
+            for row in rows:
+                record = public_case(row)
+                text = row["search_document"].casefold()
+                exact_fingerprint = bool(fingerprint and row["fingerprint"] == fingerprint)
+                matched = sum(1 for term in terms if term in text)
+                coverage = matched / len(terms) if terms else 0.0
+                phrase_bonus = 0.25 if query and " ".join(query.casefold().split()) in text else 0.0
+                score = 1.0 if exact_fingerprint else min(1.0, coverage * 0.75 + phrase_bonus)
+                relation = "fingerprint_match" if exact_fingerprint else (
+                    "lexical_similarity" if score > 0 else "recent_in_scope"
+                )
+                scored.append({**record, "score": round(score, 4), "relation": relation})
         scored.sort(key=lambda item: (item["score"], item["observed_at"] or "", item["id"]), reverse=True)
         if cursor_key is not None:
             scored = [item for item in scored if (item["score"], item["observed_at"] or "", item["id"]) < cursor_key]

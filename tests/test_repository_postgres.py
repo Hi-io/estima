@@ -4,6 +4,7 @@ import os
 import unittest
 import uuid
 from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 
 from estima.normalize import normalize_case, observation_pattern_id
 from estima.repository import EpisodeUnavailable, IdempotencyConflict, PostgresEstimaRepository
@@ -48,6 +49,30 @@ class PostgresRepositoryTests(unittest.TestCase):
     def add_case(self, episode: str, revision: int, at: datetime, observation: tuple[str, str, int], fingerprint: str | None = None, instance_suffix: str = "a") -> dict:
         case = normalize_case(payload(f"{self.prefix}-{instance_suffix}", episode, revision, at, observation, fingerprint))
         case["scope"]["cluster"] = self.cluster
+        return self.repo.create_case(case)["case"]
+
+    def add_search_case(
+        self,
+        episode: str,
+        at: datetime,
+        summary: str,
+        observations: list[dict],
+        *,
+        fingerprint: str | None = None,
+        instance_suffix: str = "a",
+        hypotheses: list[dict] | None = None,
+    ) -> dict:
+        case = normalize_case({
+            "instance_id": f"{self.prefix}-{instance_suffix}",
+            "episode_id": episode,
+            "revision": 1,
+            "observed_at": at.isoformat(),
+            "scope": {"environment": "test", "cluster": self.cluster},
+            "summary": summary,
+            "observations": observations,
+            "hypotheses": hypotheses or [],
+            "fingerprint": fingerprint,
+        })
         return self.repo.create_case(case)["case"]
 
     def test_idempotency_is_immutable_and_revisions_are_preserved(self) -> None:
@@ -187,6 +212,102 @@ class PostgresRepositoryTests(unittest.TestCase):
             repository_module.MAX_SEARCH_CANDIDATES = original_cap
         self.assertEqual(result["cases"][0]["id"], old["id"])
         self.assertEqual(result["cases"][0]["relation"], "fingerprint_match")
+
+    def test_ranker_flag_preserves_legacy_order_and_enables_typed_relevance(self) -> None:
+        now = datetime.now(timezone.utc)
+        direct = self.add_search_case(
+            "pool-direct", now - timedelta(minutes=5),
+            "Checkout transactions stalled while PostgreSQL connection pool waiters increased sharply",
+            [{"kind": "metric", "key": "db_pool_waiters", "value": 42, "unit": "requests"}],
+            fingerprint="fp:checkout-pool-wait",
+        )
+        healthy = self.add_search_case(
+            "pool-healthy", now,
+            "Checkout PostgreSQL connection pool is healthy with no waiters and normal latency",
+            [{"kind": "metric", "key": "db_pool_waiters", "value": 0, "unit": "requests"}],
+            fingerprint="fp:checkout-pool-wait",
+        )
+
+        request = {
+            "scope": {"cluster": self.cluster},
+            "query": "checkout postgres pool wait",
+            "fingerprint": "fp:checkout-pool-wait",
+            "limit": 2,
+        }
+        with patch.dict(os.environ, {"COLLECTIVE_SEARCH_RANKING_ENABLED": "false"}):
+            legacy = self.repo.search(**request)
+        with patch.dict(os.environ, {"COLLECTIVE_SEARCH_RANKING_ENABLED": "true"}):
+            ranked = self.repo.search(**request)
+
+        self.assertEqual(legacy["cases"][0]["id"], healthy["id"])
+        self.assertEqual(ranked["cases"][0]["id"], direct["id"])
+        self.assertEqual(ranked["cases"][0]["relation"], "typed_observation_match")
+
+    def test_enabled_ranker_preserves_instance_filter(self) -> None:
+        now = datetime.now(timezone.utc)
+        visible = self.add_search_case(
+            "visible", now - timedelta(minutes=1), "Pool waiters recorded",
+            [{"kind": "metric", "key": "db_pool_waiters", "value": 2, "unit": "requests"}],
+            instance_suffix="visible",
+        )
+        self.add_search_case(
+            "other-instance", now, "Checkout PostgreSQL pool waiters recorded with more detail",
+            [{"kind": "metric", "key": "db_pool_waiters", "value": 20, "unit": "requests"}],
+            instance_suffix="other",
+        )
+
+        with patch.dict(os.environ, {"COLLECTIVE_SEARCH_RANKING_ENABLED": "true"}):
+            result = self.repo.search(
+                scope={"cluster": self.cluster},
+                instance_id=f"{self.prefix}-visible",
+                query="pool wait",
+                limit=10,
+            )
+
+        self.assertEqual([case["id"] for case in result["cases"]], [visible["id"]])
+
+    def test_enabled_ranker_does_not_compare_waiter_counts_to_durations(self) -> None:
+        now = datetime.now(timezone.utc)
+        count_case = self.add_search_case(
+            "count-valued", now - timedelta(minutes=1), "Pool waiters recorded",
+            [{"kind": "metric", "key": "db_pool_waiters", "value": 2, "unit": "requests"}],
+        )
+        self.add_search_case(
+            "duration-valued", now, "Pool waiters recorded",
+            [{"kind": "metric", "key": "db_pool_waiters", "value": 250, "unit": "ms"}],
+        )
+
+        with patch.dict(os.environ, {"COLLECTIVE_SEARCH_RANKING_ENABLED": "true"}):
+            result = self.repo.search(
+                scope={"cluster": self.cluster}, query="pool wait", limit=2,
+            )
+
+        self.assertEqual(result["cases"][0]["id"], count_case["id"])
+        self.assertEqual(result["cases"][0]["relation"], "typed_observation_match")
+
+    def test_enabled_ranker_does_not_invent_results_for_empty_candidate_set(self) -> None:
+        with patch.dict(os.environ, {"COLLECTIVE_SEARCH_RANKING_ENABLED": "true"}):
+            result = self.repo.search(
+                scope={"cluster": self.cluster}, query="missing-marker-xylophone", limit=10,
+            )
+
+        self.assertEqual(result["cases"], [])
+        self.assertFalse(result["has_more"])
+        self.assertIsNone(result["next_cursor"])
+
+    def test_hypothesis_only_terms_do_not_enter_search_candidates(self) -> None:
+        self.add_search_case(
+            "hypothesis-only", datetime.now(timezone.utc), "A routine observation was recorded",
+            [{"kind": "metric", "key": "pod_restarts", "value": 1, "unit": "count"}],
+            hypotheses=[{"statement": "TLS certificate chain expired"}],
+        )
+
+        with patch.dict(os.environ, {"COLLECTIVE_SEARCH_RANKING_ENABLED": "true"}):
+            result = self.repo.search(
+                scope={"cluster": self.cluster}, query="TLS certificate chain expired", limit=10,
+            )
+
+        self.assertEqual(result["cases"], [])
 
 
 if __name__ == "__main__":
