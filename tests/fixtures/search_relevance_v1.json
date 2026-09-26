@@ -1,0 +1,175 @@
+{
+  "name": "Estima retrieval relevance v1",
+  "description": "Synthetic incident memory cases for offline search ranking checks.",
+  "k": 3,
+  "cases": [
+    {
+      "key": "pool-direct",
+      "class": "supporting",
+      "payload": {
+        "instance_id": "fcapsule-east",
+        "episode_id": "pool-direct",
+        "revision": 1,
+        "observed_at": "2026-09-24T14:00:00Z",
+        "scope": {"environment": "production", "cluster": "eval-search-v1", "namespace": "checkout", "service": "checkout-api", "workload": "checkout"},
+        "summary": "Checkout transactions stalled while PostgreSQL connection pool waiters increased sharply",
+        "observations": [
+          {"kind": "metric", "key": "db_pool_waiters", "value": 42, "unit": "requests", "source": "prometheus"},
+          {"kind": "metric", "key": "checkout_latency_p95", "value": 2300, "unit": "ms", "source": "prometheus"}
+        ],
+        "hypotheses": [{"statement": "Pool saturation is plausible but not verified", "confidence": 0.6, "supporting_refs": ["E12"]}],
+        "fingerprint": "fp:checkout-pool-wait"
+      }
+    },
+    {
+      "key": "pool-paraphrase",
+      "class": "supporting",
+      "payload": {
+        "instance_id": "fcapsule-west",
+        "episode_id": "pool-paraphrase",
+        "revision": 1,
+        "observed_at": "2026-09-24T13:00:00Z",
+        "scope": {"environment": "production", "cluster": "eval-search-v1", "namespace": "payments", "service": "payment-api", "workload": "payment"},
+        "summary": "Payment checkout threads queued while waiting to obtain PostgreSQL database connections",
+        "observations": [
+          {"kind": "metric", "key": "db_pool_waiters", "value": 33, "unit": "requests", "source": "prometheus"},
+          {"kind": "metric", "key": "checkout_latency_p95", "value": 1980, "unit": "ms", "source": "prometheus"}
+        ],
+        "hypotheses": [],
+        "fingerprint": "fp:payment-connection-queue"
+      }
+    },
+    {
+      "key": "pool-healthy",
+      "class": "healthy-negative",
+      "payload": {
+        "instance_id": "fcapsule-north",
+        "episode_id": "pool-healthy",
+        "revision": 1,
+        "observed_at": "2026-09-24T15:00:00Z",
+        "scope": {"environment": "production", "cluster": "eval-search-v1", "namespace": "checkout", "service": "checkout-api", "workload": "checkout"},
+        "summary": "Checkout PostgreSQL connection pool is healthy with no waiters and normal latency",
+        "observations": [
+          {"kind": "metric", "key": "db_pool_waiters", "value": 0, "unit": "requests", "source": "prometheus"},
+          {"kind": "metric", "key": "db_pool_in_use", "value": 8, "unit": "connections", "source": "prometheus"}
+        ],
+        "hypotheses": [],
+        "fingerprint": "fp:checkout-pool-healthy"
+      }
+    },
+    {
+      "key": "oauth-expired",
+      "class": "different-cause",
+      "payload": {
+        "instance_id": "fcapsule-south",
+        "episode_id": "oauth-expired",
+        "revision": 1,
+        "observed_at": "2026-09-24T14:45:00Z",
+        "scope": {"environment": "production", "cluster": "eval-search-v1", "namespace": "checkout", "service": "checkout-api", "workload": "checkout"},
+        "summary": "Checkout OAuth requests failed after the upstream certificate expired; PostgreSQL pool had no waiters",
+        "observations": [
+          {"kind": "log", "key": "oauth_certificate_error_count", "value": 19, "unit": "events", "source": "opensearch"},
+          {"kind": "metric", "key": "db_pool_waiters", "value": 0, "unit": "requests", "source": "prometheus"}
+        ],
+        "hypotheses": [{"statement": "An expired upstream certificate may explain the failed OAuth requests", "confidence": 0.8, "supporting_refs": ["E31"]}],
+        "fingerprint": "fp:oauth-certificate-expiry"
+      }
+    },
+    {
+      "key": "pool-contradictory",
+      "class": "contradictory",
+      "payload": {
+        "instance_id": "fcapsule-central",
+        "episode_id": "pool-contradictory",
+        "revision": 1,
+        "observed_at": "2026-09-24T15:30:00Z",
+        "scope": {"environment": "production", "cluster": "eval-search-v1", "namespace": "checkout", "service": "checkout-api", "workload": "checkout"},
+        "summary": "Checkout OAuth failures followed an upstream certificate expiry; PostgreSQL pool stayed below capacity with no waiters",
+        "observations": [
+          {"kind": "metric", "key": "db_pool_waiters", "value": 0, "unit": "requests", "source": "prometheus"},
+          {"kind": "metric", "key": "db_pool_capacity_used", "value": 8, "unit": "percent", "source": "prometheus"},
+          {"kind": "log", "key": "oauth_certificate_error_count", "value": 21, "unit": "events", "source": "opensearch"}
+        ],
+        "hypotheses": [],
+        "fingerprint": "fp:checkout-pool-wait"
+      }
+    },
+    {
+      "key": "kafka-delivery",
+      "class": "unrelated-negative",
+      "payload": {
+        "instance_id": "fcapsule-batch",
+        "episode_id": "kafka-delivery",
+        "revision": 1,
+        "observed_at": "2026-09-24T12:30:00Z",
+        "scope": {"environment": "production", "cluster": "eval-search-v1", "namespace": "orders", "service": "order-worker", "workload": "order-worker"},
+        "summary": "Order workers retried Kafka broker delivery after acknowledgment deadlines expired",
+        "observations": [{"kind": "metric", "key": "kafka_retry_count", "value": 88, "unit": "events", "source": "prometheus"}],
+        "hypotheses": [],
+        "fingerprint": "fp:kafka-ack-timeout"
+      }
+    },
+    {
+      "key": "pool-superseded-r1",
+      "class": "stale-revision",
+      "payload": {
+        "instance_id": "fcapsule-search",
+        "episode_id": "search-superseded",
+        "revision": 1,
+        "observed_at": "2026-09-24T10:00:00Z",
+        "scope": {"environment": "production", "cluster": "eval-search-v1", "namespace": "search", "service": "search-worker", "workload": "search-worker"},
+        "summary": "Search worker repeated MySQL rollback deadlocks while waiting for database pool checkout",
+        "observations": [{"kind": "log", "key": "mysql_deadlock_count", "value": 6, "unit": "events", "source": "opensearch"}],
+        "hypotheses": [],
+        "fingerprint": "fp:search-stale"
+      }
+    },
+    {
+      "key": "pool-superseded-r2",
+      "class": "stale-revision",
+      "payload": {
+        "instance_id": "fcapsule-search",
+        "episode_id": "search-superseded",
+        "revision": 2,
+        "observed_at": "2026-09-24T11:00:00Z",
+        "scope": {"environment": "production", "cluster": "eval-search-v1", "namespace": "search", "service": "search-worker", "workload": "search-worker"},
+        "summary": "Search worker recovered after data-plane certificate rotation and now completes requests",
+        "observations": [{"kind": "metric", "key": "worker_success_rate", "value": 100, "unit": "percent", "source": "prometheus"}],
+        "hypotheses": [],
+        "fingerprint": "fp:search-stale"
+      }
+    }
+  ],
+  "queries": [
+    {
+      "id": "pool-fingerprint",
+      "category": "positive-with-contradictory-fingerprint",
+      "query": "checkout postgres pool wait",
+      "fingerprint": "fp:checkout-pool-wait",
+      "scope": {"cluster": "eval-search-v1"},
+      "judgments": {"pool-direct": 3, "pool-paraphrase": 2, "pool-healthy": 0, "oauth-expired": 0, "pool-contradictory": 0, "kafka-delivery": 0, "search-superseded": 0}
+    },
+    {
+      "id": "pool-lexical-only",
+      "category": "positive-lexical",
+      "query": "checkout postgres pool wait",
+      "scope": {"cluster": "eval-search-v1"},
+      "judgments": {"pool-direct": 3, "pool-paraphrase": 2, "pool-healthy": 0, "oauth-expired": 0, "pool-contradictory": 0, "kafka-delivery": 0, "search-superseded": 0}
+    },
+    {
+      "id": "oauth-cause",
+      "category": "positive-different-cause",
+      "query": "checkout oauth certificate expired",
+      "scope": {"cluster": "eval-search-v1"},
+      "judgments": {"oauth-expired": 3, "pool-contradictory": 3, "pool-direct": 0, "pool-paraphrase": 0, "pool-healthy": 0, "kafka-delivery": 0, "search-superseded": 0}
+    },
+    {
+      "id": "superseded-stale-terms",
+      "category": "stale-revision",
+      "query": "mysql rollback deadlocks",
+      "scope": {"cluster": "eval-search-v1"},
+      "expected_empty": true,
+      "judgments": {"search-superseded": 0}
+    }
+  ]
+}
