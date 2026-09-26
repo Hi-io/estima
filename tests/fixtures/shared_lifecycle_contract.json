@@ -1,0 +1,77 @@
+{
+  "contract_version": "shared-lifecycle-v1",
+  "principals": {
+    "writer_alpha": {
+      "organization_id": "org-main",
+      "instance_id": "site-alpha",
+      "capabilities": ["publish", "read_shared", "withdraw_own", "rotate_own"]
+    },
+    "writer_bravo": {
+      "organization_id": "org-main",
+      "instance_id": "site-bravo",
+      "capabilities": ["publish", "read_shared", "withdraw_own", "rotate_own"]
+    },
+    "reader_main": {
+      "organization_id": "org-main",
+      "instance_id": null,
+      "capabilities": ["read_shared"]
+    },
+    "admin_main": {
+      "organization_id": "org-main",
+      "instance_id": null,
+      "capabilities": ["read_shared", "withdraw_any", "manage_credentials"]
+    },
+    "reader_other": {
+      "organization_id": "org-other",
+      "instance_id": null,
+      "capabilities": ["read_shared"]
+    }
+  },
+  "scenarios": [
+    {
+      "id": "publisher_identity_binding",
+      "steps": [
+        {"action": "publish", "principal": "writer_alpha", "instance_id": "site-alpha", "episode_id": "ep-a1", "revision": 1, "event_id": "event-a1-r1", "expect_status": 201},
+        {"action": "publish", "principal": "writer_alpha", "instance_id": "site-bravo", "episode_id": "ep-b1", "revision": 1, "event_id": "event-a-wrong-instance", "expect_status": 403},
+        {"action": "publish", "principal": "writer_alpha", "instance_id": "site-alpha", "episode_id": "ep-a1", "revision": 1, "event_id": "event-a1-r1", "expect_status": 200},
+        {"action": "publish", "principal": "writer_alpha", "instance_id": "site-alpha", "episode_id": "ep-a1", "revision": 1, "event_id": "event-a1-r1", "payload_variant": "changed", "expect_status": 409}
+      ]
+    },
+    {
+      "id": "organization_read_scope",
+      "steps": [
+        {"action": "publish", "principal": "writer_bravo", "instance_id": "site-bravo", "episode_id": "ep-b1", "revision": 1, "event_id": "event-b1-r1", "expect_status": 201},
+        {"action": "read_shared", "principal": "reader_main", "visible_instances": ["site-alpha", "site-bravo"], "expect_status": 200},
+        {"action": "read_shared", "principal": "reader_other", "visible_instances": [], "expect_status": 200}
+      ]
+    },
+    {
+      "id": "withdrawal_and_outbox_resurrection_defense",
+      "steps": [
+        {"action": "withdraw_episode", "principal": "writer_alpha", "instance_id": "site-alpha", "episode_id": "ep-a1", "expect_status": 204},
+        {"action": "withdraw_episode", "principal": "writer_alpha", "instance_id": "site-alpha", "episode_id": "ep-a1", "expect_status": 204},
+        {"action": "publish", "principal": "writer_alpha", "instance_id": "site-alpha", "episode_id": "ep-a1", "revision": 2, "event_id": "event-a1-r2-delayed", "expect_status": 410},
+        {"action": "read_episode", "principal": "reader_main", "instance_id": "site-alpha", "episode_id": "ep-a1", "visible": false, "pattern_member": false, "expect_status": 404},
+        {"action": "publish", "principal": "writer_alpha", "instance_id": "site-alpha", "episode_id": "ep-a2", "revision": 1, "event_id": "event-a2-r1", "expect_status": 201}
+      ]
+    },
+    {
+      "id": "withdrawal_authorization",
+      "steps": [
+        {"action": "withdraw_episode", "principal": "reader_main", "instance_id": "site-alpha", "episode_id": "ep-a2", "expect_status": 403},
+        {"action": "withdraw_episode", "principal": "writer_alpha", "instance_id": "site-bravo", "episode_id": "ep-b1", "expect_status": 403},
+        {"action": "withdraw_episode", "principal": "admin_main", "instance_id": "site-bravo", "episode_id": "ep-b1", "reason": "approved privacy request", "audit_actor": "admin_main", "expect_status": 204}
+      ]
+    },
+    {
+      "id": "credential_rotation_and_retry",
+      "steps": [
+        {"action": "rotate_credential", "principal": "writer_alpha", "new_credential_principal": "writer_alpha", "old_credential_valid_during_overlap": true, "expect_status": 200},
+        {"action": "publish", "principal": "writer_alpha_new", "instance_id": "site-alpha", "episode_id": "ep-a2", "revision": 2, "event_id": "event-a2-r2", "expect_status": 201},
+        {"action": "publish", "principal": "writer_alpha_new", "instance_id": "site-alpha", "episode_id": "ep-a2", "revision": 2, "event_id": "event-a2-r2", "expect_status": 200},
+        {"action": "authenticate", "principal": "writer_alpha_old", "after_overlap": true, "expect_status": 401},
+        {"action": "authenticate", "principal": "writer_bravo", "after_overlap": true, "expect_status": 200}
+      ]
+    }
+  ]
+}
