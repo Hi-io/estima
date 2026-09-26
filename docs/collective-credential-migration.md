@@ -1,9 +1,12 @@
 # Collective Credential Migration
 
-This runbook prepares the existing Kubernetes deployment for the access-control
-revision. It does not deploy an image or create credentials. Do not roll out the
-access-control image until every publishing FCAPSule has a publisher credential
-bound to its verified instance ID and its runtime Secret has been updated.
+This runbook describes the access-control cutover; it does not deploy an image
+or create credentials. The legacy service cannot issue managed publisher
+credentials, so they cannot exist before the access-control API is running. For
+a verified single-active-instance deployment, use the temporary legacy-binding
+bridge below: bind the old token to that one instance, deploy, issue a managed
+publisher credential, move FCAPSule Settings to it, verify publishing, then
+remove the bridge. The bridge is not suitable for multiple active publishers.
 
 ## Trust Boundary
 
@@ -47,30 +50,53 @@ rediscover and verify it at migration time. The test profile's explicitly
 configured IDs are `estima-dev-a` and `estima-dev-b` and apply only to its
 isolated test database.
 
-## Provision And Rotate
+## Temporary Single-Instance Bridge
+
+Use this bridge only when one FCAPSule instance is actively publishing to this
+Collective deployment. Compare the complete database ID list with the active
+FCAPSule Settings and its persisted instance identity. Resolve unexpected IDs
+or any second active publisher before proceeding. If multiple FCAPSule instances
+are active, do not bind the shared legacy token; use a separately staged
+credential-provisioning path or a planned write pause instead.
+
+The bridge temporarily gives the existing legacy token publisher rights for
+one verified instance while retaining its organization-wide read access. The
+token cannot publish for a caller-selected or other instance. The legacy image
+does not have a credential-issuance endpoint, so a managed publisher must be
+issued after the access-control API is running.
 
 1. Create the dedicated namespace-scoped `collective-admin-runtime` Secret
    with a strong `COLLECTIVE_ADMIN_TOKEN` through the approved secret manager.
-   It must be different from every legacy API token and remain unavailable to
+   It must differ from every legacy API token and remain unavailable to
    FCAPSule pods.
-2. For each verified instance ID, call
-   `POST /v1/admin/instances/{instance_id}/publisher-credentials` using an
-   approved credential-management client. The response contains a one-time
-   publisher secret. Capture it directly into the approved secret manager;
-   do not print, paste, persist, or log the response. Keep the returned key ID
-   with the deployment record so it can be revoked later.
-3. Update that instance's FCAPSule runtime Secret with its own publisher
-   credential and roll only that FCAPSule workload. FCAPSule uses the same
-   token for publishing and Collective browsing; publisher credentials retain
-   organization-wide read access. Do not share a publisher key between
-   instances.
-4. Confirm that the rotated instance can publish its own cases and browse
-   cases from other instances. Confirm a mismatched instance ID is rejected.
-   Only then proceed with the Collective access-control image rollout.
-5. Keep the old unbound token available for read-only rollback during the
-   migration window. It cannot publish on the new image. After all clients are
-   verified, retire the old token through the approved secret-management
-   process.
+2. Reconfirm the single active FCAPSule instance ID against the database and
+   persisted FCAPSule identity immediately before cutover. The currently
+   observed production ID above is only a local-only observation; rediscover
+   it rather than copying it into configuration.
+3. Temporarily create the `collective-legacy-binding` ConfigMap with its
+   `COLLECTIVE_LEGACY_INSTANCE_ID` key set to that verified ID. Do not put a
+   bearer token in this ConfigMap. The ConfigMap is intentionally absent from
+   the repository and is not applied by the routine deployment script.
+4. Deploy the access-control image. The old FCAPSule token is now a temporary
+   publisher only for the bound ID; mismatched instance IDs are rejected. The
+   separate admin token can issue managed credentials but cannot publish.
+5. Using an approved credential-management client, call
+   `POST /v1/admin/instances/{instance_id}/publisher-credentials` for the
+   verified ID. Capture the one-time publisher secret directly into the
+   approved secret manager. Do not print, paste, persist, or log the response.
+   Record the returned key ID for later revocation.
+6. Update FCAPSule Settings and its runtime Secret to use the new managed
+   publisher credential, then roll the FCAPSule workload. Publisher
+   credentials can both publish for their bound instance and read
+   organization-wide history, preserving Collective browsing. Confirm a new
+   publication succeeds, shared reads still work, and a mismatched instance ID
+   is rejected.
+7. Remove the temporary `collective-legacy-binding` ConfigMap and restart the
+   Collective API Deployment so the environment binding is cleared. Verify the
+   old token remains read-capable but can no longer publish, while the managed
+   publisher continues to publish and read. Retain the old token only if it is
+   still needed as a read-only credential; otherwise retire it through the
+   approved secret-management process.
 
 For a controlled rotation of a managed publisher, use
 `POST /v1/credentials/rotate` with that publisher credential. The old and new
