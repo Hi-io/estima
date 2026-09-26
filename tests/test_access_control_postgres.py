@@ -55,7 +55,7 @@ class PostgresAccessControlAcceptanceTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.context.__exit__(None, None, None)
         with self.repository._connect() as conn:
-            for key_id in reversed(self.credential_ids):
+            for key_id in self.credential_ids:
                 conn.execute("DELETE FROM atlas_api_credentials WHERE key_id = %s", (key_id,))
                 conn.execute(
                     "DELETE FROM atlas_credential_audit WHERE subject_key_id = %s OR related_key_id = %s",
